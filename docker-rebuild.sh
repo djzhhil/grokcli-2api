@@ -41,4 +41,4 @@ docker compose logs --tail=60
 echo "== health =="
 curl -sS "http://127.0.0.1:3000/health" || true
 echo
-echo "Done. /health should show version=1.8.0 and registration.engine=dongguatanglinux/grok-build-auth"
+echo "Done. /health should show version=1.8.6 and registration.engine=dongguatanglinux/grok-build-auth"
