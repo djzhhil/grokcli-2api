@@ -21,6 +21,7 @@ import quota
 import token_maintainer
 from auth import AuthError, load_credentials
 import config as _config
+import sso_to_auth_json as sso_import
 from config import (
     CLI_VERSION,
     DEFAULT_MODEL,
@@ -89,6 +90,16 @@ class ImportAuthBody(BaseModel):
     merge: bool = Field(default=True, description="Merge into existing auth.json")
 
 
+class ImportSsoBody(BaseModel):
+    """Import one or more xAI SSO cookies via HTTP device flow."""
+    sso_cookies: list[str] = Field(
+        min_length=1,
+        description="SSO cookie JWTs; one per line, supports email----pass----sso lines",
+    )
+    merge: bool = Field(default=True, description="Merge into existing auth.json")
+    delay: int = Field(default=0, ge=0, le=300, description="Seconds between accounts")
+
+
 class EmailRegistrationBody(BaseModel):
     """Start email-assisted accounts.x.ai registration."""
 
@@ -100,6 +111,7 @@ class EmailRegistrationBody(BaseModel):
     domain: str | None = Field(default=None, max_length=128)
     expiry_ms: int | None = Field(default=None, ge=60000, le=86400000)
     api_key: str | None = Field(default=None, max_length=512)
+    yescaptcha_key: str | None = Field(default=None, max_length=512)
     base_url: str | None = Field(default=None, max_length=256)
     proxy: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = Field(default=None, max_length=256)
@@ -411,6 +423,106 @@ async def import_account(
     return result
 
 
+@router.post("/accounts/import-sso")
+async def import_sso(
+    body: ImportSsoBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """
+    Import accounts from xAI SSO cookies via pure HTTP device flow.
+    Each SSO cookie is validated, used to authorize a device code, and the
+    resulting access_token / refresh_token is merged into auth.json.
+    """
+    require_admin(request, x_admin_token)
+
+    def _parse_sso_lines(lines: list[str]) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for raw in lines:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                email = ""
+                if "----" in line:
+                    parts = line.split("----")
+                    email = parts[0].strip()
+                    line = parts[-1].strip()
+                elif ":" in line and not line.startswith("eyJ"):
+                    parts = line.rsplit(":", 1)
+                    email = parts[0].strip()
+                    line = parts[-1].strip()
+                out.append((email, line))
+        return out
+
+    sso_items = _parse_sso_lines(body.sso_cookies)
+    sso_cookies = [sso for _, sso in sso_items]
+    if not sso_cookies:
+        raise HTTPException(status_code=400, detail="No valid SSO cookies provided")
+
+    results: list[dict[str, Any]] = []
+    imported: list[dict[str, Any]] = []
+    ok = 0
+    fail = 0
+
+    for i, (email_hint, sso) in enumerate(sso_items, 1):
+        item: dict[str, Any] = {"index": i, "sso_hint": sso[:12] + "..." if len(sso) > 12 else "..."}
+        try:
+            token = await asyncio.to_thread(sso_import.sso_to_token, sso)
+            if not token:
+                item["status"] = "failed"
+                item["error"] = "device flow failed or invalid sso"
+                fail += 1
+                results.append(item)
+                continue
+            key, entry = sso_import.token_to_auth_entry(token, email=email_hint)
+            import_result = accounts.import_auth_payload(
+                {
+                    "key": entry["key"],
+                    "auth_mode": entry.get("auth_mode", "oidc"),
+                    "email": entry.get("email", email_hint),
+                    "refresh_token": entry.get("refresh_token", ""),
+                    "expires_at": entry.get("expires_at"),
+                    "oidc_issuer": entry.get("oidc_issuer", sso_import.OIDC_ISSUER),
+                    "oidc_client_id": entry.get("oidc_client_id", sso_import.GROK_CLI_CLIENT_ID),
+                },
+                merge=body.merge,
+            )
+            if not import_result.get("ok"):
+                item["status"] = "failed"
+                item["error"] = import_result.get("error") or "import failed"
+                fail += 1
+                results.append(item)
+                continue
+            info = (import_result.get("imported") or [{}])[0]
+            item["status"] = "ok"
+            item["account_id"] = info.get("id")
+            item["email"] = info.get("email")
+            item["user_id"] = info.get("user_id")
+            item["expires_at"] = info.get("expires_at")
+            item["has_refresh_token"] = info.get("has_refresh_token")
+            ok += 1
+            imported.append(info)
+        except Exception as e:  # noqa: BLE001
+            item["status"] = "failed"
+            item["error"] = str(e)
+            fail += 1
+        results.append(item)
+
+        if body.delay > 0 and i < len(sso_cookies):
+            await asyncio.sleep(body.delay)
+
+    return {
+        "ok": fail == 0,
+        "message": f"SSO 导入完成：{ok} 成功, {fail} 失败",
+        "total": len(sso_cookies),
+        "success": ok,
+        "fail": fail,
+        "imported": imported,
+        "results": results,
+    }
+
+
 @router.post("/accounts/register-email")
 async def start_email_registration(
     body: EmailRegistrationBody,
@@ -434,6 +546,7 @@ async def start_email_registration(
             domain=body.domain,
             expiry_ms=body.expiry_ms,
             api_key=body.api_key,
+            yescaptcha_key=body.yescaptcha_key,
             base_url=body.base_url,
             proxy=body.proxy,
             proxy_username=body.proxy_username,

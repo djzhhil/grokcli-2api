@@ -11,3 +11,4 @@ data/
 *.log
 .idea/
 .vscode/
+register/

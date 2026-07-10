@@ -842,6 +842,10 @@
               <input id="reg-api-key" type="password" />
             </div>
             <div>
+              <label>YesCaptcha Key（可选覆盖）</label>
+              <input id="reg-yescaptcha-key" type="password" />
+            </div>
+            <div>
               <label>xAI 代理</label>
               <input id="reg-proxy" />
             </div>
@@ -870,6 +874,38 @@
             <div class="muted" id="reg-status" style="margin-top:6px;font-size:0.84rem"></div>
             <pre class="codebox" id="reg-log" style="margin-top:10px;max-height:160px;overflow:auto"></pre>
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h3>SSO Cookie 导入</h3>
+              <p>
+                粘贴或上传 xAI <code>sso</code> cookie（每行一个 JWT，或
+                <code>邮箱----密码----sso</code> /
+                <code>邮箱:密码:sso</code>）。
+                后台走 HTTP Device Flow 自动授权并写入 <span class="mono">data/auth.json</span>。
+              </p>
+            </div>
+          </div>
+          <label for="sso-cookies">SSO Cookie 列表</label>
+          <textarea id="sso-cookies" placeholder="eyJ...&#10;邮箱----密码----eyJ...&#10;邮箱:密码:eyJ..."></textarea>
+          <div class="muted" style="margin:10px 0 4px;font-size:0.82rem">或上传 .txt / .json 文件：</div>
+          <input type="file" id="sso-file" accept=".txt,.json,text/plain,application/json" />
+          <div id="sso-file-name" class="muted" style="margin-top:6px;font-size:0.82rem">未选择文件</div>
+          <div class="row" style="margin-top:12px;align-items:center">
+            <label style="display:flex;align-items:center;gap:8px;color:var(--text);margin:0">
+              <input type="checkbox" id="sso-merge" checked /> 与现有账号合并
+            </label>
+            <div>
+              <label for="sso-delay" style="margin:0">间隔秒</label>
+              <input id="sso-delay" type="number" min="0" max="300" value="0" style="max-width:80px" />
+            </div>
+            <div style="flex:0 0 auto">
+              <button class="btn primary" id="btn-import-sso">开始导入 SSO</button>
+            </div>
+          </div>
+          <div id="sso-result" class="codebox hidden" style="margin-top:12px;max-height:240px;overflow:auto"></div>
         </div>
 
         <div class="card">
@@ -1575,6 +1611,7 @@ function readRegConfig() {
     prefix: $("reg-prefix") ? $("reg-prefix").value.trim() : "",
     domain: $("reg-domain") ? $("reg-domain").value.trim() : "",
     api_key: $("reg-api-key") ? $("reg-api-key").value.trim() : "",
+    yescaptcha_key: $("reg-yescaptcha-key") ? $("reg-yescaptcha-key").value.trim() : "",
     proxy: $("reg-proxy") ? $("reg-proxy").value.trim() : "",
     proxy_username: $("reg-proxy-username") ? $("reg-proxy-username").value.trim() : "",
     proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
@@ -1588,6 +1625,7 @@ function applyRegConfig(cfg) {
   if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
   if ($("reg-domain")) $("reg-domain").value = cfg.domain || "";
   if ($("reg-api-key")) $("reg-api-key").value = cfg.api_key || "";
+  if ($("reg-yescaptcha-key")) $("reg-yescaptcha-key").value = cfg.yescaptcha_key || "";
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
   if ($("reg-proxy-username")) $("reg-proxy-username").value = cfg.proxy_username || "";
   if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
@@ -1618,6 +1656,7 @@ function buildRegBody(config, index) {
   }
   if (config.domain) body.domain = config.domain;
   if (config.api_key) body.api_key = config.api_key;
+  if (config.yescaptcha_key) body.yescaptcha_key = config.yescaptcha_key;
   if (config.proxy) body.proxy = config.proxy;
   if (config.proxy_username) body.proxy_username = config.proxy_username;
   if (config.proxy_password) body.proxy_password = config.proxy_password;
@@ -1643,6 +1682,7 @@ function showRegSession(s) {
     s.xai_proxy_enabled ? "代理已启用" : null,
     s.xai_email_code_sent ? "已发邮箱码" : null,
     s.xai_email_code_verified ? "已验邮箱码" : null,
+    s.protocol_running ? "后台运行中" : null,
     s.user_code ? `设备码 ${s.user_code}` : null,
     s.verification_url ? `验证 ${s.verification_url}` : null,
     messageCount ? `邮件 ${messageCount} 封` : null,
@@ -1664,6 +1704,8 @@ function showRegSession(s) {
     xai_email_code_verified: s.xai_email_code_verified,
     xai_email_code: s.xai_email_code,
     xai_protocol_result: s.xai_protocol_result,
+    protocol_running: s.protocol_running,
+    protocol_result: s.protocol_result,
     xai_proxy_enabled: s.xai_proxy_enabled,
     user_code: s.user_code,
     verification_url: s.verification_url,
@@ -1687,6 +1729,8 @@ function showRegSessionGroup(sessions) {
       status: s.status,
       message: s.message || s.error,
       mailbox_id: s.mailbox_id,
+      protocol_running: s.protocol_running,
+      protocol_result: s.protocol_result,
       user_code: s.user_code,
       verification_url: s.verification_url,
       account_id: s.account_id,
@@ -1982,6 +2026,67 @@ $("btn-import").onclick = async () => {
     await loadDashboard();
   } catch (e) { toast(e.message, false); }
 };
+if ($("btn-import-sso")) {
+  $("btn-import-sso").onclick = async () => {
+    const ta = $("sso-cookies");
+    const fileInput = $("sso-file");
+    let raw = ta && ta.value.trim();
+    if (!raw && fileInput && fileInput.files && fileInput.files[0]) {
+      try {
+        raw = await fileInput.files[0].text();
+      } catch (e) {
+        return toast("读取文件失败: " + e.message, false);
+      }
+    }
+    if (!raw) return toast("请粘贴 SSO cookie 或选择文件", false);
+    const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return toast("请粘贴 SSO cookie 或选择文件", false);
+    try {
+      $("btn-import-sso").disabled = true;
+      const box = $("sso-result");
+      if (box) {
+        box.classList.add("hidden");
+        box.textContent = "";
+      }
+      const delay = parseInt($("sso-delay")?.value || "0", 10) || 0;
+      const r = await api("/accounts/import-sso", {
+        method: "POST",
+        body: JSON.stringify({
+          sso_cookies: lines,
+          merge: !!$("sso-merge")?.checked,
+          delay,
+        }),
+      });
+      if (box) {
+        const rows = (r.results || []).map(x => {
+          const ok = x.status === "ok";
+          const meta = ok ? `${x.email || x.user_id || ""} ${x.has_refresh_token ? "+refresh" : ""}` : (x.error || "");
+          return `[${x.index}] ${ok ? "✅" : "❌"} ${x.sso_hint} ${meta}`;
+        });
+        box.textContent = `${r.message}\n${rows.join("\n")}`;
+        box.classList.remove("hidden");
+      }
+      toast(r.message || `已导入 ${r.imported?.length || 0} 个账号`);
+      if (ta) ta.value = "";
+      if (fileInput) fileInput.value = "";
+      if ($("sso-file-name")) $("sso-file-name").textContent = "未选择文件";
+      statusCache = await api("/status");
+      await loadDashboard();
+    } catch (e) { toast(e.message, false); }
+    finally { $("btn-import-sso").disabled = false; }
+  };
+}
+if ($("sso-file")) {
+  $("sso-file").onchange = () => {
+    const f = $("sso-file").files && $("sso-file").files[0];
+    const label = $("sso-file-name");
+    if (label) {
+      label.textContent = f
+        ? `已选择：${f.name}（${(f.size / 1024).toFixed(1)} KB）`
+        : "未选择文件";
+    }
+  };
+}
 if ($("btn-export")) {
   $("btn-export").onclick = async () => {
     try {

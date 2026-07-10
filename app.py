@@ -189,12 +189,15 @@ def _normalize_content(content: Any) -> Any:
 
 def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     """
-    Accept both OpenAI Chat Completions shape and flat xAI Responses-ish shape.
+    Accept OpenAI Chat Completions tool shape and built-in tool types.
 
-    OpenAI:
+    OpenAI function:
       {"type":"function","function":{"name":...,"description":...,"parameters":...}}
-    Flat (also seen in some SDKs):
+    Flat function (some SDKs):
       {"type":"function","name":...,"description":...,"parameters":...}
+    Built-in web search (OpenAI Responses API / Grok):
+      {"type":"web_search_preview", ...}
+      {"type":"web_search", ...}
     """
     if not tools:
         return tools
@@ -204,8 +207,12 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
             out.append(t)
             continue
         ttype = (t.get("type") or "function").lower()
+        # Built-in search tools: pass through unchanged
+        if ttype in ("web_search_preview", "web_search", "builtin_function"):
+            out.append(t)
+            continue
         if ttype != "function":
-            # pass through built-in / other tool types as-is
+            # pass through other tool types as-is
             out.append(t)
             continue
         if isinstance(t.get("function"), dict):
@@ -224,6 +231,29 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
             fn["parameters"] = params
         out.append({"type": "function", "function": fn})
     return out
+
+
+def _normalize_tool_choice(tool_choice: Any) -> Any:
+    """
+    Accept OpenAI Chat Completions tool_choice and map to upstream shape.
+    Supports: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
+              | {"type":"web_search_preview"} | {"type":"web_search"}
+    """
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice.lower()
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    tc_type = (tool_choice.get("type") or "function").lower()
+    if tc_type in ("web_search_preview", "web_search"):
+        return tool_choice
+    if tc_type != "function":
+        return tool_choice
+    fn = tool_choice.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        return {"type": "function", "function": {"name": fn["name"]}}
+    return tool_choice
 
 
 def _message_to_upstream(m: ChatMessage) -> dict[str, Any]:
@@ -260,6 +290,7 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     }
 
     tools = _normalize_tools(req.tools)
+    tool_choice = _normalize_tool_choice(req.tool_choice)
     optional = {
         "temperature": req.temperature,
         "top_p": req.top_p,
@@ -271,7 +302,7 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
         "user": req.user,
         "reasoning_effort": req.reasoning_effort,
         "tools": tools,
-        "tool_choice": req.tool_choice,
+        "tool_choice": tool_choice,
         "parallel_tool_calls": req.parallel_tool_calls,
         "functions": req.functions,
         "function_call": req.function_call,
