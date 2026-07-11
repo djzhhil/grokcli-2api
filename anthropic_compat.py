@@ -972,7 +972,13 @@ class AnthropicStreamAssembler:
     Call `feed_delta` for each content/reasoning/tool_calls piece, then `finish`.
     """
 
-    def __init__(self, *, message_id: str, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        message_id: str,
+        model: str,
+        tools_requested: bool = False,
+    ) -> None:
         self.message_id = message_id
         self.model = model
         self._next_index = 0
@@ -981,7 +987,11 @@ class AnthropicStreamAssembler:
         # OpenAI tool call index → (content_block_index, name_emitted, args_buf)
         self._tools: dict[int, dict[str, Any]] = {}
         self._started = False
-        self._saw_tool = False
+        self._saw_tool = False  # True once a tool_use block is started outbound
+        self._tools_pending = False  # upstream tool deltas seen, may be incomplete
+        self._tools_requested = bool(tools_requested)
+        # Held (content, reasoning) pairs while waiting to learn if tools win.
+        self._held_pre_tool: list[tuple[str | None, str | None]] = []
         self._output_chars = 0
 
     def start(self, input_tokens: int = 0) -> list[str]:
@@ -1089,25 +1099,16 @@ class AnthropicStreamAssembler:
             state.pop("_closing", None)
         return events
 
-    def feed(
-        self,
-        *,
-        content: str | None = None,
-        reasoning: str | None = None,
-        tool_calls: list[Any] | None = None,
+    def _emit_text_and_thinking(
+        self, content: str | None, reasoning: str | None
     ) -> list[str]:
+        """Open/continue thinking then text blocks (never across open tools)."""
         events: list[str] = []
-        if not self._started:
-            events.extend(self.start())
-
         if reasoning:
             # Never leave tool_use open across thinking/text — converters and
             # Claude Code expect stop before a new block type.
             events.extend(self._close_tools())
             if self._thinking_index is None:
-                # close text before thinking if any (order: thinking then text usually)
-                # Keep open text; Anthropic allows interleaved in theory but
-                # typically thinking comes first — if text already open, close it.
                 events.extend(self._close_text())
                 self._thinking_index = self._next_index
                 self._next_index += 1
@@ -1128,11 +1129,47 @@ class AnthropicStreamAssembler:
                 events.append(anthropic_stream_block_start_text(self._text_index))
             events.append(anthropic_stream_text_delta(self._text_index, content))
             self._output_chars += len(content)
+        return events
+
+    def feed(
+        self,
+        *,
+        content: str | None = None,
+        reasoning: str | None = None,
+        tool_calls: list[Any] | None = None,
+    ) -> list[str]:
+        events: list[str] = []
+        if not self._started:
+            events.extend(self.start())
+
+        # When the client requested tools, hold thinking/text until we know
+        # whether tools win. Opening thinking as content_block 0 then later
+        # tool_use at index 1 is valid Anthropic, but some Claude Code /
+        # secondary paths still expect tools-first on tool turns and surface
+        # "Content block not found" when mixed.
+        if self._tools_requested and not self._saw_tool:
+            if content or reasoning:
+                self._held_pre_tool.append((content, reasoning))
+                # Still count toward output estimate for usage fallbacks.
+                if content:
+                    self._output_chars += len(content)
+                if reasoning:
+                    self._output_chars += len(reasoning)
+                content, reasoning = None, None
+        elif self._tools_requested and self._saw_tool:
+            # Tools already outbound: never reopen thinking/text mid-tool turn.
+            content, reasoning = None, None
+        else:
+            events.extend(self._emit_text_and_thinking(content, reasoning))
+            content, reasoning = None, None
 
         if tool_calls:
+            self._tools_pending = True
+            # Tools win: drop held preface so block 0 can be tool_use.
+            if self._held_pre_tool:
+                self._held_pre_tool.clear()
             events.extend(self._close_thinking())
             events.extend(self._close_text())
-            self._saw_tool = True
             for raw in tool_calls:
                 if not isinstance(raw, dict):
                     continue
@@ -1194,9 +1231,10 @@ class AnthropicStreamAssembler:
                         state.get("args") or "", args_piece
                     )
 
-            # Start / flush in ascending OpenAI tool index order. If a lower tool
-            # is known but not ready, hold higher tools so converters that bind
-            # OpenAI index → first content_block never see index inversion.
+            # Start / flush in ascending OpenAI tool index order. If a lower *known*
+            # tool is not ready, hold higher tools. Sparse missing lower indices
+            # are holes — we still assign dense content_block indices via
+            # _next_index, so converters never see block 1 without block 0.
             for oi in sorted(self._tools.keys()):
                 state = self._tools[oi]
                 if state.get("stopped"):
@@ -1216,26 +1254,28 @@ class AnthropicStreamAssembler:
                         if state.get("name") or state.get("id"):
                             break
                         continue
-                    # Also wait for any lower OpenAI index that is missing or not
-                    # yet started. Without this, a high-index complete tool can
-                    # open content_block 0 first; later low-index start looks
-                    # inverted to converters → "Content block not found".
                     blocked = False
                     for lower_oi in range(0, oi):
                         lower = self._tools.get(lower_oi)
                         if lower is None:
-                            blocked = True
-                            break
+                            continue  # sparse hole
                         if lower.get("stopped"):
                             continue
                         if not lower.get("started"):
-                            blocked = True
-                            break
+                            # Only block on known lower tools (name/id/args).
+                            if (
+                                lower.get("name")
+                                or lower.get("id")
+                                or (lower.get("args") or "").strip()
+                            ):
+                                blocked = True
+                                break
                     if blocked:
                         break
                     state["block_index"] = self._next_index
                     self._next_index += 1
                     state["started"] = True
+                    self._saw_tool = True
                     events.append(
                         anthropic_stream_block_start_tool(
                             state["block_index"],
@@ -1261,6 +1301,22 @@ class AnthropicStreamAssembler:
         events: list[str] = []
         if not self._started:
             events.extend(self.start(input_tokens=int(input_tokens or 0)))
+
+        # Decide whether tools won before opening text/thinking preface.
+        has_tool_payload = any(
+            (s.get("name") or s.get("id") or (s.get("args") or "").strip())
+            and not s.get("stopped")
+            for s in self._tools.values()
+        )
+        if has_tool_payload or self._saw_tool or self._tools_pending:
+            # Tools path: drop held preface so first block can be tool_use.
+            self._held_pre_tool.clear()
+        elif self._held_pre_tool:
+            # Non-tool turn: flush held thinking/text now.
+            for held_c, held_r in self._held_pre_tool:
+                events.extend(self._emit_text_and_thinking(held_c, held_r))
+            self._held_pre_tool.clear()
+
         events.extend(self._close_thinking())
         events.extend(self._close_text())
         # Open any buffered tools that never became "started" (name without
@@ -1276,6 +1332,7 @@ class AnthropicStreamAssembler:
                     state["block_index"] = self._next_index
                     self._next_index += 1
                 state["started"] = True
+                self._saw_tool = True
                 events.append(
                     anthropic_stream_block_start_tool(
                         state["block_index"],

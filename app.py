@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.18"
+APP_VERSION = "1.8.19"
 
 
 def _on_startup() -> None:
@@ -807,6 +807,42 @@ def _merge_tool_arguments(current: str, incoming: str) -> str:
     return anth.merge_tool_argument_delta(current, incoming)
 
 
+def _tool_slot_known(entry: dict[str, Any] | None) -> bool:
+    """True when an accumulated tool slot has any identity/payload worth ordering."""
+    if not entry:
+        return False
+    if entry.get("id"):
+        return True
+    fn = entry.get("function") or {}
+    if (fn.get("name") or "").strip():
+        return True
+    args = fn.get("arguments") or ""
+    return bool(str(args).strip())
+
+
+def _assign_dense_tool_out_index(
+    acc: dict[int, dict[str, Any]], entry: dict[str, Any]
+) -> int:
+    """Map internal OpenAI tool index → dense 0..n-1 outbound index.
+
+    sub2api often binds the first seen tool_calls[].index to content_block 0.
+    Sparse upstream indices (only index=1) must not open block 1 with no block 0.
+    """
+    existing = entry.get("_out_index")
+    if isinstance(existing, int):
+        return existing
+    used = {
+        e["_out_index"]
+        for e in acc.values()
+        if isinstance(e.get("_out_index"), int)
+    }
+    out_i = 0
+    while out_i in used:
+        out_i += 1
+    entry["_out_index"] = out_i
+    return out_i
+
+
 def _tool_call_argument_delta(
     acc: dict[int, dict[str, Any]], deltas: list[Any]
 ) -> list[dict[str, Any]]:
@@ -824,7 +860,6 @@ def _tool_call_argument_delta(
     """
     if not deltas:
         return []
-    touched: list[int] = []
     for raw in deltas:
         if not isinstance(raw, dict):
             continue
@@ -871,35 +906,29 @@ def _tool_call_argument_delta(
                     entry["function"].get("arguments") or "",
                     _coerce_tool_arguments(raw.get("input")),
                 )
-        if idx not in touched:
-            touched.append(idx)
 
     out: list[dict[str, Any]] = []
-    # Emit in ascending tool index order, and never start a higher index while a
-    # lower known tool is still buffered. Secondary Anthropic converters (sub2api)
-    # map OpenAI tool index → content_block index on first sight; emitting index=1
-    # before index=0 opens the wrong block and later yields
-    # "Content block not found".
+    # Emit in ascending *upstream* tool index order, and never start a higher
+    # *known* tool while a lower known tool is still buffered. Missing lower
+    # indices are treated as sparse holes (renumbered on the wire).
     for idx in sorted(acc.keys()):
         entry = acc[idx]
-        # Skip tools not touched this round unless we are draining a held lower
-        # index that became complete earlier while a higher one arrived first.
-        # Always re-check every known index so order gates can release holds.
         args = entry.get("function", {}).get("arguments") or ""
         sent_text = entry.get("_sent_text") or ""
         name = (entry.get("function", {}).get("name") or "").strip()
 
-        # Hold higher indices while any lower OpenAI tool index is still missing
-        # or not yet emitted. Prevents index=1 opening content_block 0 first when
-        # index=0 arrives on a later chunk (sub2api / Claude Code).
         if not entry.get("_emitted"):
-            gap = False
+            blocked = False
             for lower in range(0, idx):
                 low = acc.get(lower)
-                if low is None or not low.get("_emitted"):
-                    gap = True
+                if low is None:
+                    continue  # sparse hole — dense renumber handles it
+                if low.get("_emitted"):
+                    continue
+                if _tool_slot_known(low):
+                    blocked = True
                     break
-            if gap:
+            if blocked:
                 break
 
         # Hold until arguments are one complete tool JSON object/array.
@@ -920,8 +949,9 @@ def _tool_call_argument_delta(
         if not entry.get("_emitted") and not name:
             break
 
+        out_index = _assign_dense_tool_out_index(acc, entry)
         item: dict[str, Any] = {
-            "index": idx,
+            "index": out_index,
             "type": entry.get("type") or "function",
             "function": {},
         }
@@ -947,6 +977,7 @@ def _flush_tool_call_argument_deltas(
     Prefer one complete JSON blob per tool, bundled with id/name on first
     emission so Anthropic converters (sub2api) open a single content_block.
     Truncated upstream args still flush once as a single payload.
+    Outbound indices are dense 0..n-1 in emission order.
     """
     out: list[dict[str, Any]] = []
     for idx in sorted(acc.keys()):
@@ -979,8 +1010,9 @@ def _flush_tool_call_argument_deltas(
         if not remaining:
             remaining = "{}"
 
+        out_index = _assign_dense_tool_out_index(acc, entry)
         item: dict[str, Any] = {
-            "index": idx,
+            "index": out_index,
             "type": entry.get("type") or "function",
             "function": {},
         }
@@ -1453,13 +1485,16 @@ async def _stream_proxy_with_failover(
     # that preface into content_block 0 (thinking/text), then map OpenAI
     # tool_calls[index=0] onto the same block index →
     # "apiError: Content block not found". Hold pre-tool text/reasoning and
-    # drop it from the outbound stream once tools appear (still counted in usage).
+    # drop it from the outbound stream once tool frames are actually emitted
+    # (still counted in usage). Incomplete tool previews must not release the
+    # hold or open a text block before the first tool frame.
     tools_requested = bool(body.get("tools") or body.get("functions"))
 
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
         finished = False
-        saw_tool_calls = False
+        saw_tool_calls = False  # True only after a tool frame is outbound
+        tools_pending = False  # upstream tool deltas seen but not yet emitted
         held_finish: str | None = None
         stream_started = False  # True once any content has been sent to client
         client_gone = False
@@ -1469,7 +1504,7 @@ async def _stream_proxy_with_failover(
         tool_acc: dict[int, dict[str, Any]] = {}
         reasoning_compat = _ReasoningCompatState()
         # Buffered pre-tool emissions (OpenAI path only). Flushed only if the
-        # turn ends without tool_calls.
+        # turn ends without any outbound tool frames.
         held_pre_tool: list[tuple[str | None, str | None]] = []
         try:
             async with httpx.AsyncClient(
@@ -1573,19 +1608,20 @@ async def _stream_proxy_with_failover(
                                 reasoning_parts.append(reasoning)
                             emit_tool_calls: list[Any] | None = None
                             if tool_calls:
-                                saw_tool_calls = True
+                                tools_pending = True
                                 # Sanitize cumulative re-sends so naive-append
                                 # clients (Claude Code Read) still get valid JSON.
                                 emit_tool_calls = _tool_call_argument_delta(
                                     tool_acc, tool_calls
                                 ) or None
-                                # Tools won this turn: discard any held preface so
-                                # converters never open content_block 0 as thinking
-                                # before tool_use index 0.
-                                if tools_requested and held_pre_tool:
-                                    held_pre_tool.clear()
-                                    # Reset think_tag state; preface will not ship.
-                                    reasoning_compat.think_open = False
+                                # Only when a tool frame is actually outbound do
+                                # tools "win" the turn. Incomplete name-only /
+                                # partial-arg previews must keep holding preface.
+                                if emit_tool_calls:
+                                    saw_tool_calls = True
+                                    if tools_requested and held_pre_tool:
+                                        held_pre_tool.clear()
+                                        reasoning_compat.think_open = False
 
                             emit_content, emit_reasoning = reasoning_compat.rewrite(
                                 content if content else None,
@@ -1593,25 +1629,25 @@ async def _stream_proxy_with_failover(
                             )
 
                             # Tools-requested turns: never interleave reasoning /
-                            # content with tool_calls on the wire. Hold preface
-                            # until we know the turn is non-tool, or drop it when
-                            # tools appear (fixes sub2api content_block 0 clash).
+                            # content with tool_calls on the wire.
+                            # - Hold preface until we know the turn is non-tool
+                            # - Keep holding while tools are pending incomplete
+                            # - Once tools are emitted, suppress ALL further
+                            #   content/reasoning (sub2api maps text before tool
+                            #   to content_block 0 and then fails on tool index 0)
                             if tools_requested and not saw_tool_calls:
+                                # Still buffering (no outbound tool frame yet),
+                                # whether or not incomplete tool previews arrived.
+                                # Keep holding so a non-tool finish can flush text.
                                 if emit_content or emit_reasoning:
                                     held_pre_tool.append(
                                         (emit_content, emit_reasoning)
                                     )
                                 emit_content, emit_reasoning = None, None
                             elif tools_requested and saw_tool_calls:
-                                # After tools start, suppress further reasoning
-                                # (would reopen thinking mid/after tool_use).
-                                # Allow rare trailing content only after tools
-                                # have been emitted (separate frame).
-                                if emit_reasoning and not emit_content:
-                                    emit_reasoning = None
-                                if emit_reasoning and emit_content:
-                                    # Prefer visible content; drop reasoning tail.
-                                    emit_reasoning = None
+                                # Tools already on the wire: drop all further
+                                # text/reasoning (avoids content_block clashes).
+                                emit_content, emit_reasoning = None, None
 
                             if finish:
                                 # Hold finish until stream drain so we can attach
@@ -1631,6 +1667,7 @@ async def _stream_proxy_with_failover(
                                         and not saw_tool_calls
                                         and held_pre_tool
                                     )
+                                    and not (tools_requested and saw_tool_calls)
                                 ):
                                     close_tag = reasoning_compat.close_tag_chunk()
                                     if close_tag:
@@ -1658,6 +1695,7 @@ async def _stream_proxy_with_failover(
                                         reasoning=emit_reasoning,
                                     )
                                 if emit_tool_calls:
+                                    saw_tool_calls = True
                                     yield _sse_chunk(
                                         chat_id=chat_id,
                                         model=model,
@@ -1721,11 +1759,19 @@ async def _stream_proxy_with_failover(
                             emit_tc = tool_calls or msg_tool_calls
                             sanitized_tc: list[Any] | None = None
                             if emit_tc:
-                                saw_tool_calls = True
+                                tools_pending = True
                                 if isinstance(emit_tc, list):
                                     sanitized_tc = _tool_call_argument_delta(
                                         tool_acc, emit_tc
                                     ) or None
+                                if sanitized_tc:
+                                    saw_tool_calls = True
+                            # Flush any remaining held tools from the non-SSE body.
+                            if tool_acc and not client_gone:
+                                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
+                                if flush_tc:
+                                    saw_tool_calls = True
+                                    sanitized_tc = (sanitized_tc or []) + flush_tc
                             finish_reason = _normalize_stream_finish_reason(
                                 finish_reason, saw_tool_calls=saw_tool_calls
                             ) or ("tool_calls" if saw_tool_calls else "stop")
@@ -1738,49 +1784,48 @@ async def _stream_proxy_with_failover(
                                 content if content else None,
                                 reasoning if reasoning else None,
                             )
-                            # Same sub2api clash: if this non-SSE body already
-                            # contains tools, do not open a thinking/text block
-                            # before tool_calls on the wire.
-                            if tools_requested and saw_tool_calls:
-                                emit_reasoning = None
-                                # Prefer tools-only when content is empty-ish.
-                                if not (emit_content or "").strip():
-                                    emit_content = None
+                            # Same sub2api clash: if tools won, do not open a
+                            # thinking/text block before (or with) tool_calls.
+                            if tools_requested and (
+                                saw_tool_calls or tools_pending or sanitized_tc
+                            ):
+                                emit_content, emit_reasoning = None, None
+                                held_pre_tool.clear()
+                                reasoning_compat.think_open = False
                             close_tag = reasoning_compat.close_tag_chunk()
                             if close_tag and not (
-                                tools_requested and saw_tool_calls
+                                tools_requested and (saw_tool_calls or tools_pending)
                             ):
                                 emit_content = (emit_content or "") + close_tag
-                            if emit_content:
-                                yield _sse_chunk(
-                                    chat_id=chat_id,
-                                    model=model,
-                                    created=created,
-                                    content=emit_content,
-                                )
-                            if emit_reasoning and not reasoning_compat.enabled:
-                                yield _sse_chunk(
-                                    chat_id=chat_id,
-                                    model=model,
-                                    created=created,
-                                    reasoning=emit_reasoning,
-                                )
+                            # Tools first, then content only if this is a non-tool turn.
                             if sanitized_tc and not client_gone:
+                                saw_tool_calls = True
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
                                     tool_calls=sanitized_tc,
                                 )
-                            if tool_acc and not client_gone:
-                                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
-                                if flush_tc:
-                                    yield _sse_chunk(
-                                        chat_id=chat_id,
-                                        model=model,
-                                        created=created,
-                                        tool_calls=flush_tc,
-                                    )
+                            if emit_content and not (
+                                tools_requested and saw_tool_calls
+                            ):
+                                yield _sse_chunk(
+                                    chat_id=chat_id,
+                                    model=model,
+                                    created=created,
+                                    content=emit_content,
+                                )
+                            if (
+                                emit_reasoning
+                                and not reasoning_compat.enabled
+                                and not (tools_requested and saw_tool_calls)
+                            ):
+                                yield _sse_chunk(
+                                    chat_id=chat_id,
+                                    model=model,
+                                    created=created,
+                                    reasoning=emit_reasoning,
+                                )
                             # Defer finish_reason to terminal chunk with usage.
                             finished = True
                             held_finish = finish_reason
@@ -1801,10 +1846,18 @@ async def _stream_proxy_with_failover(
                         tool_calls=flush_tc,
                     )
             final_tc = _finalize_tool_calls(tool_acc)
-            if final_tc:
-                saw_tool_calls = True
-                held_pre_tool.clear()
-                reasoning_compat.think_open = False
+            # Only treat as tool-finish when something was (or will be) emitted.
+            if final_tc and any(
+                (e.get("_emitted") or (e.get("function") or {}).get("name"))
+                for e in tool_acc.values()
+            ):
+                # Keep saw_tool_calls only if we actually shipped tool frames,
+                # or flush above already set it. Avoid finish_reason=tool_calls
+                # with zero outbound tool_calls (empty ghost slots).
+                if any(e.get("_emitted") for e in tool_acc.values()):
+                    saw_tool_calls = True
+                    held_pre_tool.clear()
+                    reasoning_compat.think_open = False
             terminal_finish = _normalize_stream_finish_reason(
                 held_finish if finished else None,
                 saw_tool_calls=saw_tool_calls,
@@ -1819,11 +1872,14 @@ async def _stream_proxy_with_failover(
                 body,
                 content="".join(content_parts),
                 reasoning="".join(reasoning_parts),
-                tool_calls=final_tc,
+                tool_calls=final_tc if saw_tool_calls else None,
                 usage=usage,
             )
             if not client_gone:
                 # Non-tool turn with tools_requested: flush held preface now.
+                # After flush above, saw_tool_calls is the source of truth —
+                # incomplete tool previews that never became outbound frames
+                # must not swallow a normal text answer.
                 if held_pre_tool and not saw_tool_calls:
                     for held_c, held_r in held_pre_tool:
                         if held_c or held_r:
@@ -1836,8 +1892,10 @@ async def _stream_proxy_with_failover(
                                 reasoning=held_r,
                             )
                     held_pre_tool.clear()
+                elif held_pre_tool and saw_tool_calls:
+                    held_pre_tool.clear()
                 close_tag = reasoning_compat.close_tag_chunk()
-                if close_tag:
+                if close_tag and not (tools_requested and saw_tool_calls):
                     yield _sse_chunk(
                         chat_id=chat_id,
                         model=model,
@@ -2226,10 +2284,13 @@ async def _stream_anthropic_with_failover(
         except (TypeError, ValueError):
             pass
 
+    tools_requested = bool(body.get("tools") or body.get("functions"))
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
         assembler = anth.AnthropicStreamAssembler(
-            message_id=message_id, model=model
+            message_id=message_id,
+            model=model,
+            tools_requested=tools_requested,
         )
         finished = False
         stream_started = False

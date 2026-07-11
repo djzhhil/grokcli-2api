@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.18**
+**当前版本：v1.8.19**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -14,14 +14,21 @@
 
 ---
 
-## 本次更新（v1.8.18）
+## 本次更新（v1.8.19）
+
+| 方向 | 内容 |
+|------|------|
+| 修复 | Claude Code / sub2api 仍报 `apiError: Content block not found`（incomplete tool 预览后泄漏正文 / 稀疏 index） |
+| 根因 | 1.8.18 在上游 tool delta **未真正出站** 时就把 `saw_tool_calls=True` 并丢弃缓冲；同时允许 tool 后 trailing content，且保留稀疏 `tool_calls.index`，sub2api 仍会把 text 开成 block 0 或跳过 block 0 |
+| 处理 | 仅在 **实际发出 tool 帧** 后判定 tools 胜出；tools 出站后抑制全部 content/reasoning；出站 tool index **稠密重编号 0..n-1**；Anthropic `/v1/messages` 同步 hold 前言 |
+| 覆盖 | OpenAI `/v1/chat/completions` 流 + Anthropic `/v1/messages` 流 |
+
+### 历史（v1.8.18）
 
 | 方向 | 内容 |
 |------|------|
 | 修复 | Claude Code / sub2api 仍报 `apiError: Content block not found`（Grok 先 reasoning 再 tool） |
-| 根因 | 请求含 tools 时上游常先流式吐 `reasoning_content`；sub2api 将其开成 `content_block 0`，随后 `tool_calls[index=0]` 再映射到同一 index → Claude Code 找不到对应 tool block |
-| 处理 | OpenAI 出站：`tools` 请求下 **缓冲** pre-tool 的 content/reasoning；一旦出现 tool_calls **丢弃**前言只出工具帧；无工具则在 finish 前再冲刷缓冲。保留 v1.8.17 的 args 完整判定 / 升序出站 |
-| 覆盖 | OpenAI `/v1/chat/completions` 流（sub2api 主路径） |
+| 处理 | OpenAI 出站缓冲 pre-tool content/reasoning；出现 tool_calls 后丢弃前言 |
 
 ### 历史（v1.8.17）
 
