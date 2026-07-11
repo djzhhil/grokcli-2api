@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.12"
+APP_VERSION = "1.8.13"
 
 
 def _on_startup() -> None:
@@ -792,15 +792,7 @@ def _extract_delta_text(chunk: dict[str, Any]) -> tuple[str, str]:
 
 def _coerce_tool_arguments(raw: Any) -> str:
     """Normalize tool arguments to the OpenAI streaming string form."""
-    if raw is None:
-        return ""
-    if isinstance(raw, str):
-        return raw
-    try:
-        return json.dumps(raw, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(raw)
-
+    return anth.sanitize_tool_arguments_json(raw)
 
 
 def _merge_tool_arguments(current: str, incoming: str) -> str:
@@ -812,37 +804,143 @@ def _merge_tool_arguments(current: str, incoming: str) -> str:
     message; always-append would yield `{"file_path":"a"}{"file_path":"a"}`
     and break Claude Code Read / Write (missing required fields after parse).
     """
-    cur = current or ""
-    piece = incoming or ""
-    if not piece:
-        return cur
-    if not cur:
-        return piece
-    if piece == cur:
-        return cur
-    # Cumulative re-send / progressive full snapshot
-    if piece.startswith(cur):
-        return piece
-    # Shorter fragment already contained
-    if cur.startswith(piece):
-        return cur
-    # Both complete JSON and equal → ignore re-send
-    try:
-        import json as _json
-        a = _json.loads(cur)
-        b = _json.loads(piece)
-        if a == b:
-            return cur
-        # cur already a complete value; do not append another full JSON blob
-        if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
-            # Prefer the longer / later complete object rather than concat
-            return piece if len(piece) >= len(cur) else cur
-        if isinstance(a, (dict, list)):
-            return cur
-    except (TypeError, ValueError):
-        pass
-    # True delta fragment
-    return cur + piece
+    return anth.merge_tool_argument_delta(current, incoming)
+
+
+def _tool_call_argument_delta(
+    acc: dict[int, dict[str, Any]], deltas: list[Any]
+) -> list[dict[str, Any]]:
+    """
+    Merge tool_call deltas into acc and return sanitized OpenAI-style deltas.
+
+    Downstream clients (Claude Code via sub2api/new-api) naive-append
+    `function.arguments`. Forwarding raw cumulative re-sends corrupts JSON and
+    drops required fields like Read.file_path. Emit incomplete suffixes live;
+    complete snapshots are deferred until `_flush_tool_call_argument_deltas`.
+    """
+    if not deltas:
+        return []
+    touched: list[int] = []
+    for raw in deltas:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            idx = int(raw.get("index", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        if idx not in acc:
+            acc[idx] = {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+                "_args_sent": 0,
+            }
+        entry = acc[idx]
+        entry.setdefault("_args_sent", 0)
+        if raw.get("id") and not entry.get("id"):
+            entry["id"] = raw["id"]
+        if raw.get("type"):
+            entry["type"] = raw["type"]
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else None
+        if fn is not None:
+            if fn.get("name"):
+                entry["function"]["name"] = _merge_tool_name(
+                    entry["function"].get("name") or "", str(fn["name"])
+                )
+            if fn.get("arguments") is not None:
+                entry["function"]["arguments"] = _merge_tool_arguments(
+                    entry["function"].get("arguments") or "",
+                    _coerce_tool_arguments(fn.get("arguments")),
+                )
+        else:
+            if raw.get("name"):
+                entry["function"]["name"] = _merge_tool_name(
+                    entry["function"].get("name") or "", str(raw["name"])
+                )
+            if raw.get("arguments") is not None:
+                entry["function"]["arguments"] = _merge_tool_arguments(
+                    entry["function"].get("arguments") or "",
+                    _coerce_tool_arguments(raw.get("arguments")),
+                )
+            elif raw.get("input") is not None:
+                entry["function"]["arguments"] = _merge_tool_arguments(
+                    entry["function"].get("arguments") or "",
+                    _coerce_tool_arguments(raw.get("input")),
+                )
+        if idx not in touched:
+            touched.append(idx)
+
+    out: list[dict[str, Any]] = []
+    for idx in touched:
+        entry = acc[idx]
+        args = entry.get("function", {}).get("arguments") or ""
+        sent_text = entry.get("_sent_text") or ""
+        remaining = ""
+        if args and anth.is_complete_json_text(args):
+            if sent_text and args.startswith(sent_text) and args != sent_text:
+                remaining = args[len(sent_text) :]
+        elif args:
+            if not sent_text:
+                remaining = args
+            elif args.startswith(sent_text):
+                remaining = args[len(sent_text) :]
+
+        name = entry.get("function", {}).get("name") or ""
+        first_emit = not entry.get("_emitted")
+        if not remaining and not (first_emit and (name or entry.get("id"))):
+            continue
+
+        item: dict[str, Any] = {
+            "index": idx,
+            "type": entry.get("type") or "function",
+            "function": {},
+        }
+        if entry.get("id") and not entry.get("_id_emitted"):
+            item["id"] = entry["id"]
+            entry["_id_emitted"] = True
+        if name and first_emit:
+            item["function"]["name"] = name
+        if remaining:
+            item["function"]["arguments"] = remaining
+            entry["_sent_text"] = sent_text + remaining
+            entry["_args_sent"] = len(entry["_sent_text"])
+        elif first_emit:
+            item["function"]["arguments"] = ""
+        if not item["function"] and not item.get("id"):
+            continue
+        entry["_emitted"] = True
+        out.append(item)
+    return out
+
+
+def _flush_tool_call_argument_deltas(
+    acc: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Emit deferred complete tool arguments before the terminal finish chunk."""
+    out: list[dict[str, Any]] = []
+    for idx in sorted(acc.keys()):
+        entry = acc[idx]
+        args = entry.get("function", {}).get("arguments") or ""
+        sent_text = entry.get("_sent_text") or ""
+        if not args:
+            continue
+        if sent_text and not args.startswith(sent_text):
+            continue
+        remaining = args[len(sent_text) :]
+        if not remaining:
+            continue
+        out.append(
+            {
+                "index": idx,
+                "type": entry.get("type") or "function",
+                "function": {"arguments": remaining},
+            }
+        )
+        entry["_sent_text"] = args
+        entry["_args_sent"] = len(args)
+        entry["_emitted"] = True
+    return out
+
 
 def _merge_tool_name(current: str, incoming: str) -> str:
     """
@@ -962,48 +1060,7 @@ def _merge_tool_call_delta(
     acc: dict[int, dict[str, Any]], deltas: list[Any]
 ) -> None:
     """Accumulate streamed tool_calls deltas into complete tool_call objects."""
-    for raw in deltas:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            idx = int(raw.get("index", 0))
-        except (TypeError, ValueError):
-            idx = 0
-        if idx not in acc:
-            acc[idx] = {
-                "id": "",
-                "type": "function",
-                "function": {"name": "", "arguments": ""},
-            }
-        entry = acc[idx]
-        if raw.get("id"):
-            # lock id once set to keep tool_result matching stable
-            if not entry.get("id"):
-                entry["id"] = raw["id"]
-        if raw.get("type"):
-            entry["type"] = raw["type"]
-        fn = raw.get("function")
-        if isinstance(fn, dict):
-            if fn.get("name"):
-                entry["function"]["name"] = _merge_tool_name(
-                    entry["function"].get("name") or "", str(fn["name"])
-                )
-            if fn.get("arguments") is not None:
-                entry["function"]["arguments"] = _merge_tool_arguments(
-                    entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(fn.get("arguments")),
-                )
-        # some upstreams put name/arguments at top level
-        elif raw.get("name") or raw.get("arguments") is not None:
-            if raw.get("name"):
-                entry["function"]["name"] = _merge_tool_name(
-                    entry["function"].get("name") or "", str(raw["name"])
-                )
-            if raw.get("arguments") is not None:
-                entry["function"]["arguments"] = _merge_tool_arguments(
-                    entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(raw.get("arguments")),
-                )
+    _tool_call_argument_delta(acc, deltas)
 
 
 def _finalize_tool_calls(
@@ -1017,26 +1074,24 @@ def _finalize_tool_calls(
         fn = entry.get("function") or {}
         if not entry.get("id") and not fn.get("name"):
             continue
-        # ensure stable id for clients that require it
-        if not entry.get("id"):
-            entry["id"] = f"call_{uuid.uuid4().hex[:24]}"
-        entry.setdefault("type", "function")
+        tool_id = entry.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         args = fn.get("arguments")
         if args is None:
             args = ""
-        elif not isinstance(args, str):
+        else:
             args = _coerce_tool_arguments(args)
-        # Empty / whitespace-only args → valid empty JSON object for tool runners
         if isinstance(args, str) and not args.strip():
             args = "{}"
-        entry["function"] = {
-            "name": (fn.get("name") or "").strip(),
-            "arguments": args,
-        }
-        if not entry["function"]["name"]:
-            # nameless tool call is unusable — drop rather than break clients
+        name = (fn.get("name") or "").strip()
+        if not name:
             continue
-        out.append(entry)
+        out.append(
+            {
+                "id": tool_id,
+                "type": entry.get("type") or "function",
+                "function": {"name": name, "arguments": args},
+            }
+        )
     return out or None
 
 
@@ -1450,9 +1505,14 @@ async def _stream_proxy_with_failover(
                                 content_parts.append(content)
                             if reasoning:
                                 reasoning_parts.append(reasoning)
+                            emit_tool_calls: list[Any] | None = None
                             if tool_calls:
                                 saw_tool_calls = True
-                                _merge_tool_call_delta(tool_acc, tool_calls)
+                                # Sanitize cumulative re-sends so naive-append
+                                # clients (Claude Code Read) still get valid JSON.
+                                emit_tool_calls = _tool_call_argument_delta(
+                                    tool_acc, tool_calls
+                                ) or None
 
                             emit_content, emit_reasoning = reasoning_compat.rewrite(
                                 content if content else None,
@@ -1478,7 +1538,7 @@ async def _stream_proxy_with_failover(
                                             content=close_tag,
                                         )
 
-                            if emit_content or emit_reasoning or tool_calls:
+                            if emit_content or emit_reasoning or emit_tool_calls:
                                 stream_started = True
                                 if client_gone:
                                     continue
@@ -1488,7 +1548,7 @@ async def _stream_proxy_with_failover(
                                     created=created,
                                     content=emit_content,
                                     reasoning=emit_reasoning,
-                                    tool_calls=tool_calls,
+                                    tool_calls=emit_tool_calls,
                                 )
                             elif finish:
                                 # finish-only upstream frame: content already held
@@ -1545,10 +1605,13 @@ async def _stream_proxy_with_failover(
                                         msg_tool_calls = msg["tool_calls"]
 
                             emit_tc = tool_calls or msg_tool_calls
+                            sanitized_tc: list[Any] | None = None
                             if emit_tc:
                                 saw_tool_calls = True
                                 if isinstance(emit_tc, list):
-                                    _merge_tool_call_delta(tool_acc, emit_tc)
+                                    sanitized_tc = _tool_call_argument_delta(
+                                        tool_acc, emit_tc
+                                    ) or None
                             finish_reason = _normalize_stream_finish_reason(
                                 finish_reason, saw_tool_calls=saw_tool_calls
                             ) or ("tool_calls" if saw_tool_calls else "stop")
@@ -1578,25 +1641,38 @@ async def _stream_proxy_with_failover(
                                     created=created,
                                     reasoning=emit_reasoning,
                                 )
-                            if emit_tc and not client_gone:
-                                indexed: list[Any] = []
-                                for i, tc in enumerate(emit_tc):
-                                    if isinstance(tc, dict):
-                                        item = dict(tc)
-                                        item.setdefault("index", i)
-                                        indexed.append(item)
-                                    else:
-                                        indexed.append(tc)
+                            if sanitized_tc and not client_gone:
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
-                                    tool_calls=indexed,
+                                    tool_calls=sanitized_tc,
                                 )
+                            if tool_acc and not client_gone:
+                                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
+                                if flush_tc:
+                                    yield _sse_chunk(
+                                        chat_id=chat_id,
+                                        model=model,
+                                        created=created,
+                                        tool_calls=flush_tc,
+                                    )
                             # Defer finish_reason to terminal chunk with usage.
                             finished = True
                             held_finish = finish_reason
 
+            # Flush deferred complete tool-argument snapshots before finish so
+            # clients that only naive-append stream deltas still get full args.
+            if tool_acc and not client_gone:
+                flush_tc = _flush_tool_call_argument_deltas(tool_acc)
+                if flush_tc:
+                    saw_tool_calls = True
+                    yield _sse_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        created=created,
+                        tool_calls=flush_tc,
+                    )
             final_tc = _finalize_tool_calls(tool_acc)
             if final_tc:
                 saw_tool_calls = True

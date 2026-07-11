@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.12**
+**当前版本：v1.8.13**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -14,14 +14,14 @@
 
 ---
 
-## 本次更新（v1.8.12）
+## 本次更新（v1.8.13）
 
 | 方向 | 内容 |
 |------|------|
-| 修复 | 二次反代（Claude Code → sub2api → grokcli-2api）下 tool arguments 完整重发导致 JSON 拼接损坏 |
-| 影响 | Claude Code `Read` 等工具出现 `file_path` 缺失 / `InputValidationError` |
-| 处理 | OpenAI 累积与 Anthropic 流式均对 tool args 做 delta/累计去重；解析端恢复 `}{` 双份 JSON |
-| 模板 | `.env.example` + 启动脚本复制模板；默认 `REASONING_COMPAT=off` |
+| 修复 | 二次反代下 tool arguments 仍可能损坏 Claude Code `Read`（`file_path` 缺失） |
+| 根因 | 1.8.12 只修了内部累积；OpenAI 流仍把 cumulative 重发原样转出，客户端 naive-append 拼坏 JSON |
+| 处理 | 出站 tool args 只发未发送后缀；完整 JSON 快照延后到 finish 再 flush；单包 `}{` 双份 JSON 入口清洗 |
+| 覆盖 | OpenAI `/v1/chat/completions` 流 + Anthropic `/v1/messages` 流 + finalize/parse |
 
 ### 相关环境变量（可选）
 

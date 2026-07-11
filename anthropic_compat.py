@@ -454,39 +454,102 @@ def map_finish_to_stop_reason(
     return "end_turn"
 
 
+def sanitize_tool_arguments_json(raw: Any) -> str:
+    """
+    Normalize tool argument text and recover doubled JSON blobs.
+
+    Secondary relays may emit one chunk containing two complete objects:
+    `{"file_path":"a"}{"file_path":"a"}`. Clients that concatenate stream
+    pieces then fail required-field validation (Claude Code Read/Write).
+
+    When the input is already a single valid JSON value, return the original
+    string unchanged so true OpenAI delta suffixes keep prefix continuity.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, (dict, list)):
+        try:
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(raw)
+    if not isinstance(raw, str):
+        try:
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(raw)
+
+    s = raw
+    if not s:
+        return ""
+    try:
+        json.loads(s)
+        return s
+    except json.JSONDecodeError:
+        pass
+
+    stripped = s.strip()
+    if stripped and stripped != s:
+        try:
+            json.loads(stripped)
+            return stripped
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    src = stripped or s
+    idx = 0
+    n = len(src)
+    values: list[Any] = []
+    ends: list[int] = []
+    while idx < n:
+        while idx < n and src[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(src, idx)
+        except json.JSONDecodeError:
+            break
+        values.append(obj)
+        ends.append(end)
+        idx = end
+    if len(values) < 2:
+        return s
+
+    first = values[0]
+    first_text = src[: ends[0]].strip()
+    if all(v == first for v in values[1:]):
+        return first_text
+    return first_text
+
+
+def is_complete_json_text(s: str) -> bool:
+    """True when s is one full JSON value (object/array/scalar)."""
+    if not s or not str(s).strip():
+        return False
+    try:
+        json.loads(s)
+        return True
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
     """Parse tool arguments; recover doubled JSON from secondary relays."""
     if raw is None:
         return {}
     if isinstance(raw, dict):
         return raw
+    if isinstance(raw, list):
+        return {"value": raw}
     if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
+        cleaned = sanitize_tool_arguments_json(raw)
+        if not cleaned:
             return {}
         try:
-            parsed = json.loads(s)
+            parsed = json.loads(cleaned)
             return parsed if isinstance(parsed, dict) else {"value": parsed}
         except json.JSONDecodeError:
-            # e.g. {"file_path":"a"}{"file_path":"a"} from re-sent full args
-            decoder = json.JSONDecoder()
-            try:
-                obj, idx = decoder.raw_decode(s)
-                if isinstance(obj, dict):
-                    rest = s[idx:].strip()
-                    if not rest:
-                        return obj
-                    try:
-                        obj2, _ = decoder.raw_decode(rest)
-                        if obj2 == obj:
-                            return obj
-                    except json.JSONDecodeError:
-                        pass
-                    return obj
-                if isinstance(obj, dict):
-                    return obj
-            except json.JSONDecodeError:
-                pass
             return {"_raw": raw}
     return {"value": raw}
 
@@ -826,8 +889,8 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
     Secondary relays may re-broadcast the full arguments JSON; naive append
     corrupts Claude Code tools (Read requires file_path, etc.).
     """
-    cur = current or ""
-    piece = incoming or ""
+    cur = sanitize_tool_arguments_json(current) if current else ""
+    piece = sanitize_tool_arguments_json(incoming) if incoming else ""
     if not piece:
         return cur
     if not cur:
@@ -844,9 +907,18 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
         if a == b:
             return cur
         if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
-            return piece if len(piece) >= len(cur) else cur
+            # Prefer later complete object (field growth / correction).
+            return piece
         if isinstance(a, (dict, list)):
             return cur
+        if isinstance(b, (dict, list)):
+            return piece
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    # cur already complete — refuse trailing junk (`}` / second blob)
+    try:
+        json.loads(cur)
+        return cur
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
     return cur + piece
@@ -914,12 +986,7 @@ class AnthropicStreamAssembler:
     def _coerce_args_piece(raw: Any) -> str:
         if raw is None:
             return ""
-        if isinstance(raw, str):
-            return raw
-        try:
-            return json.dumps(raw, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return str(raw)
+        return sanitize_tool_arguments_json(raw)
 
     def feed(
         self,
@@ -1026,18 +1093,30 @@ class AnthropicStreamAssembler:
                             name=state["name"],
                         )
                     )
-                # Emit only the unsent suffix so cumulative re-sends do not
-                # duplicate partial_json (breaks Read file_path parsing).
+                # Stream incomplete fragments only. Complete JSON snapshots
+                # (common with secondary relays) are deferred to finish() so
+                # naive-append clients never see doubled / non-prefix rewrites
+                # that break Read.file_path parsing.
                 if state["started"]:
-                    sent = int(state.get("args_sent") or 0)
-                    remaining = (state.get("args") or "")[sent:]
+                    args = state.get("args") or ""
+                    sent_text = state.get("args_sent_text") or ""
+                    remaining = ""
+                    if args and is_complete_json_text(args):
+                        if sent_text and args.startswith(sent_text) and args != sent_text:
+                            remaining = args[len(sent_text) :]
+                    elif args:
+                        if not sent_text:
+                            remaining = args
+                        elif args.startswith(sent_text):
+                            remaining = args[len(sent_text) :]
                     if remaining:
                         events.append(
                             anthropic_stream_input_json_delta(
                                 state["block_index"], remaining
                             )
                         )
-                        state["args_sent"] = len(state.get("args") or "")
+                        state["args_sent_text"] = sent_text + remaining
+                        state["args_sent"] = len(state["args_sent_text"])
                         self._output_chars += len(remaining)
 
         return events
@@ -1064,44 +1143,47 @@ class AnthropicStreamAssembler:
                         name=(state.get("name") or "tool").strip() or "tool",
                     )
                 )
-                if state.get("args"):
-                    sent = int(state.get("args_sent") or 0)
-                    remaining = state["args"][sent:]
-                    if remaining:
-                        events.append(
-                            anthropic_stream_input_json_delta(
-                                state["block_index"], remaining
-                            )
-                        )
-                        self._output_chars += len(remaining)
+                args = state.get("args") or ""
+                if args:
+                    events.append(
+                        anthropic_stream_input_json_delta(state["block_index"], args)
+                    )
+                    state["args_sent_text"] = args
+                    state["args_sent"] = len(args)
+                    self._output_chars += len(args)
                 else:
-                    # Emit empty object so clients can parse tool input
                     events.append(
                         anthropic_stream_input_json_delta(state["block_index"], "{}")
                     )
                     state["args"] = "{}"
+                    state["args_sent_text"] = "{}"
                     state["args_sent"] = 2
                     self._output_chars += 2
             else:
-                # If tool started but no args streamed, ensure valid JSON object
-                if not (state.get("args") or "").strip():
+                args = state.get("args") or ""
+                sent_text = state.get("args_sent_text") or ""
+                if not args.strip():
                     events.append(
                         anthropic_stream_input_json_delta(state["block_index"], "{}")
                     )
                     state["args"] = "{}"
+                    state["args_sent_text"] = "{}"
                     state["args_sent"] = 2
                     self._output_chars += 2
+                elif sent_text and not args.startswith(sent_text):
+                    # Client already has a non-prefix snapshot; do not corrupt it.
+                    pass
                 else:
-                    sent = int(state.get("args_sent") or 0)
-                    remaining = state["args"][sent:]
+                    remaining = args[len(sent_text) :]
                     if remaining:
                         events.append(
                             anthropic_stream_input_json_delta(
                                 state["block_index"], remaining
                             )
                         )
+                        state["args_sent_text"] = args
+                        state["args_sent"] = len(args)
                         self._output_chars += len(remaining)
-                        state["args_sent"] = len(state["args"])
             if state.get("started"):
                 events.append(anthropic_stream_block_stop(state["block_index"]))
         # Upstream often finishes with stop even when tools were emitted.

@@ -4,9 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "== git =="
-git fetch --all
-git reset --hard origin/main
-echo "HEAD=$(git rev-parse --short HEAD)"
+# Do NOT hard-reset: that discards uncommitted local fixes mid-deploy.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git status -sb || true
+  echo "HEAD=$(git rev-parse --short HEAD)"
+fi
 
 echo "== local fingerprint =="
 python3 - <<'PY' || python - <<'PY'
@@ -54,4 +56,4 @@ docker compose logs --tail=60
 echo "== health =="
 curl -sS "http://127.0.0.1:3000/health" || true
 echo
-echo "Done. /health should show version=1.8.12 and registration.engine=dongguatanglinux/grok-build-auth"
+echo "Done. /health should show version=1.8.13 and registration.engine=dongguatanglinux/grok-build-auth"
