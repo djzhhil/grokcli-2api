@@ -2243,6 +2243,60 @@ async def stop_email_registration_session(
     return result
 
 
+@router.post("/accounts/register-email/batches/{batch_id}/resume")
+async def resume_email_registration_batch(
+    batch_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    force: int = 1,
+):
+    """Reclaim orphan sessions and re-spawn a dead batch runner (after restart)."""
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    resumable = getattr(adapter, "resume_registration_batch", None)
+    if not callable(resumable):
+        raise HTTPException(status_code=501, detail="batch resume API not available")
+    result = resumable(batch_id, force=bool(force))
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "resume failed")
+    audit_log(
+        request,
+        action="register.batch_resume",
+        summary=(
+            f"恢复注册批次：{batch_id} remaining={result.get('remaining')} "
+            f"reclaimed={result.get('reclaimed')}"
+        ),
+        target_type="registration",
+        target_id=batch_id,
+    )
+    return result
+
+
+@router.post("/accounts/register-email/reclaim")
+async def reclaim_orphaned_registrations(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    auto_resume: int = 1,
+):
+    """Reclaim orphan sessions; optionally auto-resume open batches."""
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    fn = getattr(adapter, "reclaim_orphaned_registration_batches", None)
+    if not callable(fn):
+        raise HTTPException(status_code=501, detail="reclaim API not available")
+    result = fn(auto_resume=bool(auto_resume))
+    audit_log(
+        request,
+        action="register.reclaim",
+        summary=(
+            f"回收孤儿注册：sessions={result.get('sessions_reclaimed')} "
+            f"batches={result.get('batches_resumed')}"
+        ),
+        target_type="registration",
+    )
+    return result
+
+
 @router.post("/accounts/register-email/batches/{batch_id}/stop")
 async def stop_email_registration_batch(
     batch_id: str,

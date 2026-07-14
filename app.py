@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.78"
+APP_VERSION = "1.9.79"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -580,6 +580,22 @@ def _on_startup() -> None:
                 f"(engine={st.get('engine') or 'grok-build-auth'} "
                 f"build={st.get('adapter_build')})"
             )
+            # After image upgrade / process restart the batch runner is gone but
+            # Redis sessions stay non-terminal (solving_turnstile…). Reclaim and
+            # auto-resume a few newest open batches so registration does not hang.
+            try:
+                auto = str(os.environ.get("GROK2API_REG_AUTO_RESUME", "1") or "1").strip().lower()
+                if auto not in {"0", "false", "no", "off"}:
+                    reclaim = getattr(_reg, "reclaim_orphaned_registration_batches", None)
+                    if callable(reclaim):
+                        rr = reclaim(auto_resume=True)
+                        print(
+                            "  registration reclaim: "
+                            f"sessions={rr.get('sessions_reclaimed') or 0} "
+                            f"batches_resumed={rr.get('batches_resumed') or 0}"
+                        )
+            except Exception as e:  # noqa: BLE001
+                print(f"  registration reclaim skipped: {e}")
         else:
             print(
                 f"  registration: unavailable ({st.get('error')}) "

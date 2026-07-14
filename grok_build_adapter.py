@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-14-local-solver-wait-1"
+ADAPTER_BUILD = "2026-07-15-global-inflight-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -82,8 +82,69 @@ _active_batch_runners: dict[str, bool] = {}
 # Local captcha solver is process-local and can collapse under fan-out; serialize
 # the createTask/getTaskResult handshake across registration workers.
 _local_captcha_lock = threading.RLock()
+# Cross-batch in-flight registration jobs (3 open batches * 8 workers used to
+# stampede local Camoufox + xAI device-flow). Cap total concurrent registrations.
+try:
+    _GLOBAL_REG_INFLIGHT_MAX = max(
+        1,
+        min(
+            32,
+            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "6") or 6),
+        ),
+    )
+except (TypeError, ValueError):
+    _GLOBAL_REG_INFLIGHT_MAX = 6
+_global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
+# Soft rate-limit signal: after device-flow / captcha storms, temporarily reduce
+# new job admission without killing already-running workers.
+_reg_soft_pause_until = 0.0
+_reg_soft_pause_lock = threading.Lock()
 _xconsole_ready = False
 _xconsole_error: str | None = None
+
+
+def _note_reg_pressure(reason: str = "", *, pause_sec: float | None = None) -> None:
+    """Backoff new admissions briefly when upstream rate-limits hit."""
+    global _reg_soft_pause_until
+    try:
+        sec = float(
+            pause_sec
+            if pause_sec is not None
+            else (os.environ.get("GROK2API_REG_SOFT_PAUSE_SEC", "8") or 8)
+        )
+    except (TypeError, ValueError):
+        sec = 8.0
+    sec = max(1.0, min(60.0, sec))
+    with _reg_soft_pause_lock:
+        _reg_soft_pause_until = max(_reg_soft_pause_until, time.time() + sec)
+    if reason:
+        print(f"[registration] soft-pause {sec:.0f}s ({reason})")
+
+
+def _wait_reg_admission(*, check_cancel=None) -> None:
+    """Block until global inflight slot is free and soft-pause window ends."""
+    while True:
+        if check_cancel is not None:
+            try:
+                check_cancel()
+            except Exception:
+                raise
+        with _reg_soft_pause_lock:
+            wait = _reg_soft_pause_until - time.time()
+        if wait > 0:
+            time.sleep(min(1.0, wait))
+            continue
+        # non-blocking try then short sleep to stay cancel-friendly
+        if _global_reg_inflight.acquire(blocking=False):
+            return
+        time.sleep(0.15)
+
+
+def _release_reg_admission() -> None:
+    try:
+        _global_reg_inflight.release()
+    except Exception:
+        pass
 
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
@@ -1398,7 +1459,7 @@ def _spawn_batch_runner(
     expiry_ms: int | None,
     mail_provider: str | None = None,
 ) -> dict[str, Any]:
-    """Start the ThreadPool spawner for a batch. No resume/restart path."""
+    """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
     if not bid:
         return {"ok": False, "error": "missing batch id"}
@@ -1519,13 +1580,24 @@ def _spawn_batch_runner(
         b["reg_config"]["proxy_strategy"] = proxy_strat
         b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
         b["updated_at"] = _now()
+        # Preserve historical counters when reclaiming after process restart;
+        # only reset if this is a brand-new spawn with no prior progress.
+        prior_finished = int(b.get("finished") or 0)
+        prior_ok = int(b.get("ok_count") or 0)
+        prior_fail = int(b.get("fail_count") or 0)
         b["message"] = (
             f"starting remaining={remaining} threads={workers}"
+            + (f" already_done={prior_finished}" if prior_finished else "")
             + (f" proxies={len(proxy_pool)}" if proxy_pool else "")
         )
-        b["finished"] = 0
-        b["ok_count"] = 0
-        b["fail_count"] = 0
+        if prior_finished <= 0 and not (b.get("session_ids") or []):
+            b["finished"] = 0
+            b["ok_count"] = 0
+            b["fail_count"] = 0
+        else:
+            b["finished"] = prior_finished
+            b["ok_count"] = prior_ok
+            b["fail_count"] = prior_fail
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
 
@@ -1533,9 +1605,11 @@ def _spawn_batch_runner(
         from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         errors: list[str] = []
-        finished = 0
-        ok_n = 0
-        fail_n = 0
+        with _lock:
+            _seed = dict(_batches.get(bid) or batch or {})
+        finished = int(_seed.get("finished") or 0)
+        ok_n = int(_seed.get("ok_count") or 0)
+        fail_n = int(_seed.get("fail_count") or 0)
         stop_renew = False
         # Feed the pool gradually: only keep ~workers(+prefetch) jobs prepared
         # at once. Submitting all remaining jobs up-front used to create hundreds
@@ -1691,9 +1765,40 @@ def _spawn_batch_runner(
                     _mirror_reg_sess(sid, _sessions[sid])
             if not sid or receiver is None:
                 return {"ok": False, "error": "registration session prepare failed", "id": sid}
+            # Cross-batch admission control: many resumed batches otherwise all
+            # run concurrency=8 and overwhelm local captcha + device-flow.
+            admitted = False
             try:
+                def _job_cancel() -> None:
+                    with _lock:
+                        sess2 = _sessions.get(sid) or {}
+                        b2 = _batches.get(bid) or {}
+                        if (
+                            sess2.get("cancel_requested")
+                            or b2.get("cancel_requested")
+                        ):
+                            raise _RegCancelled("cancelled while waiting for admission")
+
+                _wait_reg_admission(check_cancel=_job_cancel)
+                admitted = True
                 _run_registration(sid, key, job_proxy or "", receiver)
+            except _RegCancelled as e:
+                with _lock:
+                    if sid in _sessions:
+                        _sessions[sid]["status"] = "cancelled"
+                        _sessions[sid]["error"] = str(e)
+                        _sessions[sid]["message"] = str(e)
+                        _sessions[sid]["updated_at"] = _now()
+                        _mirror_reg_sess(sid, _sessions[sid])
+                return {
+                    "ok": False,
+                    "id": sid,
+                    "status": "cancelled",
+                    "error": str(e),
+                }
             finally:
+                if admitted:
+                    _release_reg_admission()
                 with _lock:
                     if sid in _sessions:
                         _sessions[sid].pop("_receiver", None)
@@ -2167,7 +2272,25 @@ def _run_registration(
             if provider == "local":
                 with _local_captcha_lock:
                     _check_cancel()
-                    return solver.solve_turnstile(**kwargs)
+                    try:
+                        return solver.solve_turnstile(**kwargs)
+                    except Exception as e:
+                        # Camoufox queue meltdown / timeout → brief global pause
+                        msg = str(e).lower()
+                        if any(
+                            k in msg
+                            for k in (
+                                "timeout",
+                                "timed out",
+                                "queue",
+                                "busy",
+                                "no browser",
+                                "target closed",
+                                "crashed",
+                            )
+                        ):
+                            _note_reg_pressure(f"local captcha: {e}")
+                        raise
             return solver.solve_turnstile(**kwargs)
 
         try:
@@ -2506,6 +2629,7 @@ def _run_registration(
 
         token = sso_import.sso_to_token(sso)
         if not token or not token.get("access_token"):
+            _note_reg_pressure("device-flow conversion failed", pause_sec=10)
             raise RuntimeError(
                 "SSO obtained but sso_to_auth_json conversion failed "
                 "(device verify/approve/token poll; often xAI device-flow "
@@ -2694,6 +2818,418 @@ def _run_registration(
                     finished=True,
                     detail={**payload["detail"], "phase": "finished"},
                 )
+
+
+
+def _nonterminal_session_statuses() -> frozenset[str]:
+    return frozenset(
+        {
+            "pending",
+            "queued",
+            "starting",
+            "started",
+            "running",
+            "probing",
+            "solving_turnstile",
+            "waiting_email",
+            "fetching_sso",
+            "converting",
+            "importing",
+            "stopping",
+        }
+    )
+
+
+def reclaim_orphaned_registration_sessions(
+    *,
+    stale_sec: float | None = None,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark abandoned non-terminal sessions as error so a batch can resume.
+
+    After process restart / image upgrade, in-flight workers die but Redis still
+    shows ``solving_turnstile`` etc. Those sessions never finish, and the
+    batch runner is gone — registration appears "hung mid-way".
+    """
+    try:
+        ttl = float(
+            stale_sec
+            if stale_sec is not None
+            else (os.environ.get("GROK2API_REG_STALE_SEC", "180") or 180)
+        )
+    except (TypeError, ValueError):
+        ttl = 180.0
+    ttl = max(30.0, min(ttl, 3600.0))
+    now = _now()
+    nonterm = _nonterminal_session_statuses()
+    want_batch = (batch_id or "").strip() or None
+
+    reclaimed: list[dict[str, Any]] = []
+    # Prefer durable Redis list when available.
+    sessions: list[dict[str, Any]] = []
+    if _reg_redis():
+        try:
+            from store import sessions_redis
+
+            listed = sessions_redis.reg_sess_list() or []
+            if isinstance(listed, list):
+                sessions = [s for s in listed if isinstance(s, dict)]
+        except Exception:
+            sessions = []
+    if not sessions:
+        with _lock:
+            sessions = [dict(v) for v in _sessions.values() if isinstance(v, dict)]
+
+    for sess in sessions:
+        sid = str(sess.get("id") or "").strip()
+        if not sid:
+            continue
+        bid = str(sess.get("batch_id") or "").strip()
+        if want_batch and bid != want_batch:
+            continue
+        st = str(sess.get("status") or "").strip().lower()
+        if st in _TERMINAL_STATUSES or st not in nonterm:
+            continue
+        # Always reclaim if no local/remote runner can own it; use stale age as
+        # a safety so we don't kill a still-running worker in the same process.
+        age = now - float(sess.get("updated_at") or sess.get("created_at") or 0)
+        # If this process holds an active runner for the batch, only reclaim
+        # sessions older than ttl (true stalls). If no runner, reclaim all
+        # non-terminal after a short grace (30s) so resume can proceed.
+        has_runner = False
+        if bid:
+            with _lock:
+                has_runner = bool(_active_batch_runners.get(bid))
+            if not has_runner and _reg_redis():
+                try:
+                    from store.redis_client import get_str as redis_get
+
+                    has_runner = bool(redis_get(_batch_runner_lock_key(bid)))
+                except Exception:
+                    has_runner = False
+        min_age = ttl if has_runner else min(30.0, ttl)
+        if age < min_age:
+            continue
+        msg = (
+            f"reclaimed orphan session after {age:.0f}s "
+            f"(status was {st}; runner_alive={has_runner})"
+        )
+        with _lock:
+            cur = _sessions.get(sid) or dict(sess)
+            prev = str(cur.get("status") or "").strip().lower()
+            already_terminal = prev in _TERMINAL_STATUSES
+            cur["status"] = "error"
+            cur["error"] = msg
+            cur["message"] = msg
+            cur["cancel_requested"] = False
+            cur["updated_at"] = now
+            _sessions[sid] = cur
+            _mirror_reg_sess(sid, dict(cur))
+            # Count orphan as failed completion so batch remaining does not overshoot.
+            if bid and not already_terminal:
+                b = _batches.get(bid) or _load_reg_batch(bid) or {"id": bid}
+                b = dict(b)
+                b["fail_count"] = int(b.get("fail_count") or 0) + 1
+                b["finished"] = int(b.get("finished") or 0) + 1
+                b["updated_at"] = now
+                if not b.get("message"):
+                    b["message"] = "reclaimed orphan sessions"
+                _batches[bid] = b
+                _mirror_reg_batch(bid, dict(b))
+        reclaimed.append(
+            {
+                "id": sid,
+                "batch_id": bid,
+                "prev_status": st,
+                "age_sec": int(age),
+                "email": sess.get("email"),
+            }
+        )
+    return {
+        "ok": True,
+        "reclaimed": len(reclaimed),
+        "stale_sec": ttl,
+        "items": reclaimed[:100],
+    }
+
+
+def resume_registration_batch(
+    batch_id: str,
+    *,
+    force: bool = False,
+    reclaim_stale_sec: float | None = None,
+) -> dict[str, Any]:
+    """Reclaim orphan sessions and re-spawn the batch runner for remaining count.
+
+    Used after process restart when Redis still shows status=running but no
+    worker is actually spawning jobs.
+    """
+    bid = str(batch_id or "").strip()
+    if not bid:
+        return {"ok": False, "error": "missing batch id"}
+    batch = _load_reg_batch(bid)
+    if not batch:
+        return {"ok": False, "error": "registration batch not found"}
+
+    st = str(batch.get("status") or "").strip().lower()
+    if st in {"done", "cancelled", "stopped"} and not force:
+        return {
+            "ok": False,
+            "error": f"batch already terminal ({st}); pass force=true to resume",
+            "batch_id": bid,
+            "status": st,
+        }
+    if batch.get("cancel_requested") and not force:
+        return {
+            "ok": False,
+            "error": "batch cancel_requested; clear stop or pass force=true",
+            "batch_id": bid,
+        }
+
+    # Drop dead runner lock if our process does not own it (TTL may still hold).
+    if force and _reg_redis():
+        try:
+            from store.redis_client import get_str as redis_get
+
+            lock_k = _batch_runner_lock_key(bid)
+            token = redis_get(lock_k)
+            with _lock:
+                local_alive = bool(_active_batch_runners.get(bid))
+            if token and not local_alive:
+                try:
+                    from store.redis_client import compare_and_delete
+
+                    compare_and_delete(lock_k, str(token))
+                except Exception:
+                    try:
+                        # last resort: overwrite with short TTL empty marker then let expire
+                        from store.redis_client import set_ex
+
+                        set_ex(lock_k, "reclaimed", 1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    reclaimed = reclaim_orphaned_registration_sessions(
+        stale_sec=reclaim_stale_sec, batch_id=bid
+    )
+
+    count = int(batch.get("count") or 0)
+    finished = int(batch.get("finished") or 0)
+    # Prefer durable session list to compute remaining if counters lag.
+    sids = list(batch.get("session_ids") or [])
+    terminal = 0
+    if sids and _reg_redis():
+        try:
+            from store import sessions_redis
+
+            for sid in sids:
+                sess = sessions_redis.reg_sess_get(str(sid)) or {}
+                st_s = str(sess.get("status") or "").lower()
+                if st_s in _TERMINAL_STATUSES:
+                    terminal += 1
+        except Exception:
+            terminal = finished
+    else:
+        terminal = finished
+    remaining = max(0, count - max(finished, terminal))
+    if remaining <= 0:
+        with _lock:
+            b = _batches.get(bid) or dict(batch)
+            b["status"] = "done" if int(b.get("fail_count") or 0) == 0 else "partial"
+            b["runner_alive"] = False
+            b["updated_at"] = _now()
+            b["message"] = (
+                f"resume: nothing remaining "
+                f"(count={count} finished={finished} terminal={terminal})"
+            )
+            _batches[bid] = b
+            _mirror_reg_batch(bid, dict(b))
+        return {
+            "ok": True,
+            "batch_id": bid,
+            "remaining": 0,
+            "reclaimed": reclaimed.get("reclaimed") or 0,
+            "message": "batch already complete",
+            "status": (_load_reg_batch(bid) or {}).get("status"),
+        }
+
+    cfg = batch.get("reg_config") if isinstance(batch.get("reg_config"), dict) else {}
+    provider = str(cfg.get("captcha_provider") or CAPTCHA_PROVIDER or "local").strip().lower()
+    key = str(cfg.get("yescaptcha_key") or "").strip()
+    proxy = str(cfg.get("proxy") or "").strip()
+    workers = int(cfg.get("concurrency") or batch.get("concurrency") or DEFAULT_CONCURRENCY)
+    # Local captcha is the bottleneck; when resuming after restart, prefer a
+    # safer concurrency so multiple auto-resumed batches don't thrash Camoufox.
+    if provider == "local":
+        try:
+            local_cap = int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "3") or 3)
+        except (TypeError, ValueError):
+            local_cap = 3
+        workers = max(1, min(workers, max(1, local_cap)))
+    stagger = int(cfg.get("stagger_ms") or batch.get("stagger_ms") or 400)
+    # Spread job starts a bit more under pressure.
+    try:
+        min_stagger = int(os.environ.get("GROK2API_REG_MIN_STAGGER_MS", "600") or 600)
+    except (TypeError, ValueError):
+        min_stagger = 600
+    if provider == "local":
+        stagger = max(stagger, min_stagger)
+    mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
+    proxy_strategy = str(cfg.get("proxy_strategy") or "round_robin").strip().lower()
+
+    # Clear cancel so spawn is allowed.
+    with _lock:
+        b = _batches.get(bid) or dict(batch)
+        b["cancel_requested"] = False
+        if str(b.get("status") or "").lower() in {"stopping", "cancelled", "stopped", "error"}:
+            b["status"] = "running"
+        b["updated_at"] = _now()
+        b["message"] = (
+            f"resume requested remaining={remaining} "
+            f"(reclaimed={reclaimed.get('reclaimed') or 0})"
+        )
+        _batches[bid] = b
+        _mirror_reg_batch(bid, dict(b))
+
+    spawned = _spawn_batch_runner(
+        bid,
+        remaining=remaining,
+        concurrency=workers,
+        stagger_ms=stagger,
+        captcha_provider=provider,
+        yescaptcha_key=key,
+        proxy=proxy,
+        proxy_strategy=proxy_strategy,
+        moemail_api_key=cfg.get("moemail_api_key"),
+        moemail_base_url=cfg.get("moemail_base_url"),
+        prefix=cfg.get("prefix"),
+        domain=cfg.get("domain"),
+        expiry_ms=cfg.get("expiry_ms"),
+        mail_provider=mail_provider,
+    )
+    out = {
+        "ok": bool(spawned.get("ok")),
+        "batch_id": bid,
+        "remaining": remaining,
+        "reclaimed": reclaimed.get("reclaimed") or 0,
+        "reclaim": reclaimed,
+        "spawn": spawned,
+        "message": spawned.get("message") or spawned.get("error"),
+    }
+    if not out["ok"]:
+        out["error"] = spawned.get("error") or "spawn failed"
+    return out
+
+
+def reclaim_orphaned_registration_batches(
+    *,
+    stale_sec: float | None = None,
+    auto_resume: bool = True,
+    max_batches: int | None = None,
+) -> dict[str, Any]:
+    """On startup: reclaim orphan sessions and optionally resume open batches."""
+    try:
+        ttl = float(
+            stale_sec
+            if stale_sec is not None
+            else (os.environ.get("GROK2API_REG_STALE_SEC", "120") or 120)
+        )
+    except (TypeError, ValueError):
+        ttl = 120.0
+    if max_batches is None:
+        try:
+            max_batches = int(os.environ.get("GROK2API_REG_AUTO_RESUME_MAX", "1") or 1)
+        except (TypeError, ValueError):
+            max_batches = 1
+    max_batches = max(0, min(10, int(max_batches)))
+
+    # First pass: mark dead in-flight sessions.
+    sess_result = reclaim_orphaned_registration_sessions(stale_sec=ttl)
+
+    batches: list[dict[str, Any]] = []
+    if _reg_redis():
+        try:
+            from store import sessions_redis
+
+            listed = sessions_redis.reg_batch_list() or []
+            if isinstance(listed, list):
+                batches = [b for b in listed if isinstance(b, dict)]
+        except Exception:
+            batches = []
+    if not batches:
+        with _lock:
+            batches = [dict(v) for v in _batches.values() if isinstance(v, dict)]
+
+    resumed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    # Newest first.
+    batches = sorted(
+        batches, key=lambda b: float(b.get("updated_at") or b.get("created_at") or 0), reverse=True
+    )
+    for b in batches:
+        if len(resumed) >= max(0, int(max_batches)):
+            break
+        bid = str(b.get("id") or "").strip()
+        if not bid:
+            continue
+        st = str(b.get("status") or "").strip().lower()
+        if st not in {"running", "starting", "stopping", "partial"} and not (
+            st == "error" and int(b.get("finished") or 0) < int(b.get("count") or 0)
+        ):
+            continue
+        if b.get("cancel_requested") and st in {"stopping", "cancelled", "stopped"}:
+            skipped.append({"batch_id": bid, "reason": "cancel_requested", "status": st})
+            continue
+        # Skip only if THIS process has a live runner. Redis locks from a dead
+        # process (image restart) must not block auto-resume forever — force
+        # clear them when no local runner owns the batch.
+        has_local = False
+        with _lock:
+            has_local = bool(_active_batch_runners.get(bid))
+        if has_local:
+            skipped.append({"batch_id": bid, "reason": "local_runner_alive", "status": st})
+            continue
+        if _reg_redis():
+            try:
+                from store.redis_client import get_str as redis_get
+
+                token = redis_get(_batch_runner_lock_key(bid))
+                if token:
+                    # Stale lock from previous process — clear so resume can claim.
+                    try:
+                        from store.redis_client import compare_and_delete
+
+                        compare_and_delete(_batch_runner_lock_key(bid), str(token))
+                    except Exception:
+                        try:
+                            from store.redis_client import set_ex
+
+                            set_ex(_batch_runner_lock_key(bid), "reclaimed", 1)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        count = int(b.get("count") or 0)
+        finished = int(b.get("finished") or 0)
+        if count > 0 and finished >= count:
+            skipped.append({"batch_id": bid, "reason": "already_finished", "status": st})
+            continue
+        if not auto_resume:
+            skipped.append({"batch_id": bid, "reason": "auto_resume_disabled", "status": st})
+            continue
+        r = resume_registration_batch(bid, force=True, reclaim_stale_sec=ttl)
+        resumed.append(r)
+
+    return {
+        "ok": True,
+        "sessions_reclaimed": sess_result.get("reclaimed") or 0,
+        "session_reclaim": sess_result,
+        "batches_resumed": sum(1 for r in resumed if r.get("ok")),
+        "resumed": resumed,
+        "skipped": skipped[:20],
+    }
 
 
 def stop_registration_session(session_id: str) -> dict[str, Any]:
