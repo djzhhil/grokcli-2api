@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.63"
+APP_VERSION = "1.9.64"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -2332,9 +2332,16 @@ def _extract_delta_text(chunk: dict[str, Any]) -> tuple[str, str]:
     return content, reasoning
 
 
-def _coerce_tool_arguments(raw: Any) -> str:
-    """Normalize tool arguments to the OpenAI streaming string form."""
-    return anth.sanitize_tool_arguments_json(raw)
+def _coerce_tool_arguments(raw: Any, *, tool_name: str | None = None) -> str:
+    """Normalize tool arguments to the OpenAI streaming string form.
+
+    Prefer alias-aware normalize (path→file_path, oldString→old_string) so
+    Update/Edit readiness gates and outbound frames match Claude Code schema.
+    """
+    try:
+        return anth.normalize_tool_arguments_json(raw, tool_name=tool_name)
+    except Exception:
+        return anth.sanitize_tool_arguments_json(raw)
 
 
 def _merge_tool_arguments(
@@ -2437,15 +2444,19 @@ async def _emit_tool_sse_serial(
     created: int,
     tool_calls: list[Any],
     already_emitted: int = 0,
+    max_tools: int | None = None,
+    protocol: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield tool SSE frames one-by-one with keepalive + optional real delay.
 
-    Respects OUTBOUND_MAX_TOOLS via remaining budget. Marks nothing in tool_acc —
+    Respects the protocol-aware outbound tool budget. Marks nothing in tool_acc —
     callers must only pass already-built outbound items.
     """
     if not tool_calls:
         return
-    budget = history_compact.remaining_outbound_tool_budget(already_emitted)
+    budget = history_compact.remaining_outbound_tool_budget(
+        already_emitted, max_tools=max_tools, protocol=protocol
+    )
     gap = float(getattr(history_compact, "OUTBOUND_TOOL_GAP_SEC", 0.0) or 0.0)
     first = True
     emitted_here = 0
@@ -2538,10 +2549,11 @@ def _ingest_tool_call_deltas(
                     entry["function"].get("name") or "", str(fn["name"])
                 )
             if fn.get("arguments") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(fn.get("arguments")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(fn.get("arguments"), tool_name=_tn),
+                    tool_name=_tn,
                 )
         else:
             if raw.get("name"):
@@ -2549,16 +2561,18 @@ def _ingest_tool_call_deltas(
                     entry["function"].get("name") or "", str(raw["name"])
                 )
             if raw.get("arguments") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(raw.get("arguments")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(raw.get("arguments"), tool_name=_tn),
+                    tool_name=_tn,
                 )
             elif raw.get("input") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(raw.get("input")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(raw.get("input"), tool_name=_tn),
+                    tool_name=_tn,
                 )
 
 
@@ -2642,10 +2656,14 @@ def _tool_call_argument_delta(
             break
 
         if not name:
-            # Known id without name — keep holding this slot.
+            # Name/id known but args incomplete — hold (do not open block early).
+            # Critical for Update/Edit: {"file_path":"..."} alone is NOT ready.
             if entry.get("id") or str(args).strip():
                 break
             continue
+        # Alias-normalize before readiness (path→file_path, oldString→old_string).
+        args = _coerce_tool_arguments(args, tool_name=name)
+        entry.setdefault("function", {})["arguments"] = args
         if not args or not anth.is_complete_tool_arguments_json(
             args, tool_name=name
         ):
@@ -2661,7 +2679,11 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
     """Flush at most one still-held tool (terminal / non-SSE safe for sub2api).
 
     Must not mark sibling tools as emitted — callers loop until empty.
-    Truncated upstream args still ship once as a single best-effort payload.
+
+    Prefer complete required-key payloads. Incomplete Update/Edit objects (only
+    file_path) are *not* shipped at terminal: better empty-turn failover than a
+    client-side wrong edit. Truncated non-JSON still ships once as best-effort
+    only when no required-key schema is known.
     """
     for idx in sorted(acc.keys()):
         entry = acc[idx]
@@ -2670,8 +2692,8 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
         fn = entry.get("function") or {}
         name = (fn.get("name") or "").strip()
         args = fn.get("arguments") or ""
-        if not isinstance(args, str):
-            args = _coerce_tool_arguments(args)
+        args = _coerce_tool_arguments(args, tool_name=name or None)
+        entry.setdefault("function", {})["arguments"] = args
         # Drop fully empty ghost slots.
         if not name and not entry.get("id") and not str(args).strip():
             continue
@@ -2679,9 +2701,16 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
             # Cannot open a useful tool_use without a name.
             continue
         remaining = str(args) if str(args).strip() else "{}"
-        # Terminal flush: still prefer required keys when possible, but if the
-        # stream ended with a partial object, ship best-effort rather than drop.
         if not anth.is_complete_tool_arguments_json(remaining, tool_name=name):
+            # Known schema incomplete (e.g. Update missing old/new) — drop rather
+            # than force a broken tool call that Claude Code will "run" wrong.
+            required = ()
+            try:
+                required = anth._required_keys_for_tool(name)  # type: ignore[attr-defined]
+            except Exception:
+                required = ()
+            if required:
+                continue
             remaining = str(args) if str(args).strip() else "{}"
         return [_build_outbound_tool_item(acc, entry, remaining=remaining)]
     return []
@@ -2689,12 +2718,15 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
 
 def _flush_tool_call_argument_deltas(
     acc: dict[int, dict[str, Any]],
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
 ) -> list[dict[str, Any]]:
     """Flush still-held tools as a list (one complete JSON blob per tool).
 
     Prefer _flush_one_tool_call + loop on the SSE path so sub2api never sees a
     multi-tool burst without per-tool framing. This helper remains for bulk
-    collection; OUTBOUND_MAX_TOOLS (default 1 for sub2api) can still cap the returned list
+    collection; the protocol-aware tool cap can still trim the returned list
     without marking unreturned siblings as emitted.
     """
     out: list[dict[str, Any]] = []
@@ -2703,7 +2735,9 @@ def _flush_tool_call_argument_deltas(
         if not one:
             break
         out.extend(one)
-    capped = history_compact.cap_outbound_tools(out)
+    capped = history_compact.cap_outbound_tools(
+        out, max_tools=max_tools, protocol=protocol
+    )
     if capped is None:
         return out
     if len(capped) < len(out):
@@ -2759,7 +2793,9 @@ def _legacy_function_call_to_tool_calls(function_call: Any) -> list[dict[str, An
             "type": "function",
             "function": {
                 "name": str(name or ""),
-                "arguments": _coerce_tool_arguments(args),
+                "arguments": _coerce_tool_arguments(
+                    args, tool_name=str(name or "") or None
+                ),
             },
         }
     ]
@@ -2812,7 +2848,10 @@ def _extract_delta_parts(
                     fn.get("arguments"), str
                 ):
                     fn = dict(fn)
-                    fn["arguments"] = _coerce_tool_arguments(fn.get("arguments"))
+                    _tn = str(fn.get("name") or item.get("name") or "") or None
+                    fn["arguments"] = _coerce_tool_arguments(
+                        fn.get("arguments"), tool_name=_tn
+                    )
                     item["function"] = fn
                 tool_calls.append(item)
         else:
@@ -2852,15 +2891,23 @@ def _finalize_tool_calls(
             continue
         tool_id = entry.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         args = fn.get("arguments")
+        name = (fn.get("name") or "").strip()
         if args is None:
             args = ""
         else:
-            args = _coerce_tool_arguments(args)
+            args = _coerce_tool_arguments(args, tool_name=name or None)
         if isinstance(args, str) and not args.strip():
             args = "{}"
-        name = (fn.get("name") or "").strip()
         if not name:
             continue
+        # Skip schema-incomplete known tools (Update without old/new, etc.).
+        if not anth.is_complete_tool_arguments_json(str(args), tool_name=name):
+            try:
+                required = anth._required_keys_for_tool(name)  # type: ignore[attr-defined]
+            except Exception:
+                required = ()
+            if required:
+                continue
         out.append(
             {
                 "id": tool_id,
@@ -3607,6 +3654,7 @@ async def _stream_proxy_with_failover_inner(
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
     timing: RequestTiming | None = None,
+    protocol: str = "openai",
 ) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
@@ -3620,6 +3668,8 @@ async def _stream_proxy_with_failover_inner(
     # (still counted in usage). Incomplete tool previews must not release the
     # hold or open a text block before the first tool frame.
     tools_requested = _body_requests_tools(body)
+    # Pure OpenAI chat defaults to unlimited tools; Claude/sub2api stay capped.
+    outbound_max_tools = history_compact.resolve_outbound_max_tools(protocol)
 
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
@@ -3633,7 +3683,7 @@ async def _stream_proxy_with_failover_inner(
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, Any]] = {}
-        tools_emitted_count = 0  # enforces OUTBOUND_MAX_TOOLS across the turn
+        tools_emitted_count = 0  # enforces outbound tool cap across the turn
         reasoning_compat = _ReasoningCompatState()
         # Buffered pre-tool emissions (OpenAI path only). Flushed only if the
         # turn ends without any outbound tool frames.
@@ -3738,11 +3788,14 @@ async def _stream_proxy_with_failover_inner(
                     async for line in _aiter_sse_lines_with_keepalive(resp):
                         # Soft disconnect check: keep draining so we can still
                         # emit a terminal finish/tool_calls frame when possible.
+                        # Probe failures must NOT flip client_gone — Starlette's
+                        # is_disconnected() can raise under backpressure and a
+                        # false positive used to hard-cut the SSE mid-turn.
                         try:
                             if await client_disconnected():
                                 client_gone = True
                         except Exception:
-                            client_gone = True
+                            pass
                         if line is None:
                             # idle keepalive for newapi / reverse proxies
                             if not client_gone:
@@ -3789,7 +3842,9 @@ async def _stream_proxy_with_failover_inner(
                             # Remaining tools emit on later ticks / terminal
                             # flush, still one frame at a time.
                             budget = history_compact.remaining_outbound_tool_budget(
-                                tools_emitted_count
+                                tools_emitted_count,
+                                max_tools=outbound_max_tools,
+                                protocol=protocol,
                             )
                             if budget is not None and budget <= 0:
                                 # Cap reached: still ingest for accounting, no emit.
@@ -3906,6 +3961,8 @@ async def _stream_proxy_with_failover_inner(
                                     created=created,
                                     tool_calls=emit_tool_calls,
                                     already_emitted=tools_emitted_count,
+                                    max_tools=outbound_max_tools,
+                                    protocol=protocol,
                                 ):
                                     yield _tc_frame
                                     if _tc_frame.startswith("data: "):
@@ -3918,7 +3975,9 @@ async def _stream_proxy_with_failover_inner(
                                 # one window but we only emit one per upstream line.
                                 while True:
                                     _budget2 = history_compact.remaining_outbound_tool_budget(
-                                        tools_emitted_count
+                                        tools_emitted_count,
+                                        max_tools=outbound_max_tools,
+                                        protocol=protocol,
                                     )
                                     if _budget2 is not None and _budget2 <= 0:
                                         break
@@ -3934,6 +3993,8 @@ async def _stream_proxy_with_failover_inner(
                                         created=created,
                                         tool_calls=more,
                                         already_emitted=tools_emitted_count,
+                                        max_tools=outbound_max_tools,
+                                        protocol=protocol,
                                     ):
                                         yield _tc_frame
                                         if _tc_frame.startswith("data: "):
@@ -4055,6 +4116,8 @@ async def _stream_proxy_with_failover_inner(
                                 created=created,
                                 tool_calls=sanitized_tc,
                                 already_emitted=tools_emitted_count,
+                                max_tools=outbound_max_tools,
+                                protocol=protocol,
                             ):
                                 yield _tc_frame
                                 if _tc_frame.startswith("data: "):
@@ -4090,7 +4153,9 @@ async def _stream_proxy_with_failover_inner(
                 # active content_block). Keepalive + wall-clock gap between tools.
                 while True:
                     budget = history_compact.remaining_outbound_tool_budget(
-                        tools_emitted_count
+                        tools_emitted_count,
+                        max_tools=outbound_max_tools,
+                        protocol=protocol,
                     )
                     if budget is not None and budget <= 0:
                         break
@@ -4106,6 +4171,8 @@ async def _stream_proxy_with_failover_inner(
                         created=created,
                         tool_calls=one,
                         already_emitted=tools_emitted_count,
+                        max_tools=outbound_max_tools,
+                        protocol=protocol,
                     ):
                         yield _tc_frame
                         if _tc_frame.startswith("data: "):
@@ -4196,35 +4263,42 @@ async def _stream_proxy_with_failover_inner(
                 tool_calls=final_tc if saw_tool_calls else None,
                 usage=usage,
             )
-            if not client_gone:
-                # Non-tool turn with tools_requested: flush held preface now.
-                # After flush above, saw_tool_calls is the source of truth —
-                # incomplete tool previews that never became outbound frames
-                # must not swallow a normal text answer.
-                if held_pre_tool and not saw_tool_calls:
-                    for held_c, held_r in held_pre_tool:
-                        if held_c or held_r:
-                            stream_started = True
-                            yield _sse_chunk(
-                                chat_id=chat_id,
-                                model=model,
-                                created=created,
-                                content=held_c,
-                                reasoning=held_r,
-                            )
+            # Soft disconnect must still close the SSE envelope. Skipping finish /
+            # [DONE] after mid-stream content is the intermittent "hard cut" that
+            # makes sub2api/Claude Code stop scheduling further turns.
+            try:
+                if not client_gone:
+                    # Non-tool turn with tools_requested: flush held preface now.
+                    # After flush above, saw_tool_calls is the source of truth —
+                    # incomplete tool previews that never became outbound frames
+                    # must not swallow a normal text answer.
+                    if held_pre_tool and not saw_tool_calls:
+                        for held_c, held_r in held_pre_tool:
+                            if held_c or held_r:
+                                stream_started = True
+                                yield _sse_chunk(
+                                    chat_id=chat_id,
+                                    model=model,
+                                    created=created,
+                                    content=held_c,
+                                    reasoning=held_r,
+                                )
+                        held_pre_tool.clear()
+                    elif held_pre_tool and saw_tool_calls:
+                        held_pre_tool.clear()
+                    close_tag = reasoning_compat.close_tag_chunk()
+                    if close_tag and not (tools_requested and saw_tool_calls):
+                        yield _sse_chunk(
+                            chat_id=chat_id,
+                            model=model,
+                            created=created,
+                            content=close_tag,
+                        )
+                elif held_pre_tool:
                     held_pre_tool.clear()
-                elif held_pre_tool and saw_tool_calls:
-                    held_pre_tool.clear()
-                close_tag = reasoning_compat.close_tag_chunk()
-                if close_tag and not (tools_requested and saw_tool_calls):
-                    yield _sse_chunk(
-                        chat_id=chat_id,
-                        model=model,
-                        created=created,
-                        content=close_tag,
-                    )
                 # Single terminal finish frame WITH usage (Scheme A). This is the
                 # chunk secondary relays like sub2api inspect for token billing.
+                # Always emit once the upstream turn ends (even if client_gone).
                 yield _sse_chunk(
                     chat_id=chat_id,
                     model=model,
@@ -4242,6 +4316,9 @@ async def _stream_proxy_with_failover_inner(
                     include_choices=False,
                 )
                 yield "data: [DONE]\n\n"
+            except Exception:
+                # Client socket already gone — nothing more we can ship.
+                pass
             _record_usage_safe(
                 usage=norm_usage,
                 ok=True,
@@ -5216,13 +5293,25 @@ async def openai_responses(
 
                             ctype = (resp.headers.get("content-type") or "").lower()
                             if "text/event-stream" in ctype or "stream" in ctype:
+                                client_gone = False
                                 async for line in _aiter_sse_lines_with_keepalive(resp):
-                                    if await request.is_disconnected():
-                                        return
+                                    # Probe failures must NOT flip client_gone —
+                                    # is_disconnected() can raise under backpressure
+                                    # and a false positive hard-cuts mid-turn.
+                                    try:
+                                        if await request.is_disconnected():
+                                            client_gone = True
+                                    except Exception:
+                                        pass
                                     if line is None:
-                                        # Keepalive only after the stream is open;
-                                        # silent empty attempts must remain retryable.
-                                        if stream_started:
+                                        # Always poke the client during long thinking /
+                                        # tool-prep gaps. SSE comments do NOT open the
+                                        # Responses envelope, so empty turns remain
+                                        # silent-failoverable for Claude Code / sub2api.
+                                        # Previously we only keepalive'd after
+                                        # stream_started — xhigh TTFT of 6–20s then
+                                        # idle-closed the secondary relay.
+                                        if not client_gone:
                                             yield _sse_keepalive()
                                         continue
                                     parsed = _parse_sse_line(line)
@@ -5246,15 +5335,20 @@ async def openai_responses(
                                             timing.mark_first_token(kind="content")
                                             # on_text_delta already opens envelope.
                                             stream_started = True
-                                            for frame in text_frames:
-                                                yield frame
+                                            if not client_gone:
+                                                for frame in text_frames:
+                                                    yield frame
                                     if reasoning:
                                         # Keep reasoning internal. Do NOT open the
                                         # Responses envelope on pure-thinking chunks —
                                         # if the turn ends with no text/tools, we must
                                         # still be able to silent-failover (Claude Code
                                         # reports empty envelope as malformed HTTP 200).
+                                        # Still emit SSE keepalive so long thinking
+                                        # gaps do not idle-close secondary relays.
                                         reasoning_parts.append(reasoning)
+                                        if not client_gone:
+                                            yield _sse_keepalive()
                                     if tool_calls:
                                         _merge_tool_call_delta(
                                             tool_acc, tool_calls
@@ -5270,8 +5364,13 @@ async def openai_responses(
                                             _note_success_once()
                                             timing.mark_first_token(kind="tool")
                                             stream_started = True
-                                            for frame in tool_frames:
-                                                yield frame
+                                            if not client_gone:
+                                                for frame in tool_frames:
+                                                    yield frame
+                                        elif not client_gone:
+                                            # Incomplete tool previews still mean the
+                                            # upstream is alive — poke the client.
+                                            yield _sse_keepalive()
                             else:
                                 # Rare non-SSE upstream response: fall back to one-shot.
                                 raw = await resp.aread()
@@ -5428,11 +5527,30 @@ async def openai_responses(
                                 for frame in streamer.fail(empty_err):
                                     yield frame
                                 return
-                            for frame in complete_frames:
-                                if await request.is_disconnected():
-                                    return
-                                stream_started = True
-                                yield frame
+                            # Soft disconnect still needs a clean terminal (completed/failed + DONE).
+                            # Skipping here is the intermittent hard-cut that makes
+                            # Claude Code / sub2api stop scheduling further turns.
+                            # Prefer complete_frames (success path) over fail when
+                            # we already have client-visible payload.
+                            try:
+                                if client_gone and not stream_started and not complete_frames:
+                                    # Never opened and nothing to ship — stay silent.
+                                    pass
+                                elif complete_frames:
+                                    for frame in complete_frames:
+                                        stream_started = True
+                                        yield frame
+                                elif stream_started and not streamer._closed:
+                                    for f in streamer.fail("client disconnected"):
+                                        yield f
+                            except Exception:
+                                # Socket already gone — best-effort terminal only.
+                                if stream_started and not streamer._closed:
+                                    try:
+                                        for f in streamer.fail("client disconnected"):
+                                            yield f
+                                    except Exception:
+                                        pass
                             _record_usage_safe(
                                 usage=ledger_usage,
                                 ok=True,
@@ -5443,11 +5561,25 @@ async def openai_responses(
                                 stream=True,
                             )
                             return
+                    except asyncio.CancelledError:
+                        # Client/proxy cancelled mid-stream. Prefer a clean
+                        # Responses terminal over a silent TCP drop.
+                        if stream_started:
+                            try:
+                                if not streamer._closed:
+                                    for frame in streamer.fail("stream cancelled"):
+                                        yield frame
+                            except Exception:
+                                pass
+                        return
                     except Exception as e:  # noqa: BLE001
                         if stream_started:
                             # Continue monotonic sequence_number after live deltas.
-                            for frame in streamer.fail(f"Proxy error: {e}"):
-                                yield frame
+                            try:
+                                for frame in streamer.fail(f"Proxy error: {e}"):
+                                    yield frame
+                            except Exception:
+                                pass
                             return
                         await asyncio.to_thread(
                             account_pool.report_failure,
@@ -5459,8 +5591,11 @@ async def openai_responses(
                         last_error = f"Proxy error: {e}"
                         if idx < len(chain) - 1:
                             continue
-                        for frame in streamer.fail(last_error):
-                            yield frame
+                        try:
+                            for frame in streamer.fail(last_error):
+                                yield frame
+                        except Exception:
+                            pass
                         return
                 for frame in oai_resp.failed_responses_sse(
                     response_id=response_id,
@@ -5634,7 +5769,7 @@ async def _stream_anthropic_with_failover_inner(
             message_id=message_id,
             model=model,
             tools_requested=tools_requested,
-            max_tools=history_compact.OUTBOUND_MAX_TOOLS,
+            max_tools=history_compact.resolve_outbound_max_tools("anthropic"),
         )
         finished = False
         stream_started = False
@@ -5731,15 +5866,20 @@ async def _stream_anthropic_with_failover_inner(
                 client_gone = False
                 if "text/event-stream" in ctype or "stream" in ctype:
                     async for line in _aiter_sse_lines_with_keepalive(resp):
+                        # Probe failures must NOT flip client_gone — false
+                        # positives hard-cut the Anthropic SSE mid-turn.
                         try:
                             if await client_disconnected():
                                 client_gone = True
                         except Exception:
-                            client_gone = True
+                            pass
                         if line is None:
-                            # Keepalive/ping only after stream is open so empty
-                            # attempts remain invisible to the client.
-                            if stream_started and not client_gone:
+                            # Always ping during long thinking / tool-prep gaps.
+                            # Anthropic pings do NOT open the message envelope, so
+                            # empty turns remain silent-failoverable. Skipping
+                            # pre-start pings used to idle-close sub2api during
+                            # xhigh first-token delays.
+                            if not client_gone:
                                 yield anth.anthropic_stream_ping()
                             continue
                         parsed = _parse_sse_line(line)
@@ -5768,39 +5908,47 @@ async def _stream_anthropic_with_failover_inner(
                             usage = parsed["usage"]
                             continue
                         if content or reasoning or tool_calls:
-                            if content:
-                                content_seen = True
-                                saw_model_output = True
-                            if reasoning:
-                                reasoning_seen = True
-                                if str(reasoning).strip():
+                            # Soft-disconnect before any client bytes: do not mark
+                            # success / model-output or open the envelope. Keep the
+                            # turn silent so empty-200 failover still works when the
+                            # client briefly flaps (or the probe is late).
+                            if not (client_gone and not stream_started):
+                                if content:
+                                    content_seen = True
                                     saw_model_output = True
-                            if tool_calls:
-                                saw_model_output = True
-                            if timing is not None and (
-                                content or tool_calls or reasoning
-                            ):
-                                timing.mark_first_token(
-                                    kind=(
-                                        "tool"
-                                        if tool_calls
-                                        else ("content" if content else "reasoning")
+                                if reasoning:
+                                    reasoning_seen = True
+                                    if str(reasoning).strip():
+                                        saw_model_output = True
+                                if tool_calls:
+                                    saw_model_output = True
+                                if timing is not None and (
+                                    content or tool_calls or reasoning
+                                ):
+                                    timing.mark_first_token(
+                                        kind=(
+                                            "tool"
+                                            if tool_calls
+                                            else (
+                                                "content" if content else "reasoning"
+                                            )
+                                        )
                                     )
-                                )
-                            _note_success_once()
-                            open_frames = _open_anthropic_stream()
-                            if open_frames and not client_gone:
-                                for ev in open_frames:
+                                _note_success_once()
+                                if not stream_started:
+                                    open_frames = _open_anthropic_stream()
+                                    if open_frames and not client_gone:
+                                        for ev in open_frames:
+                                            yield ev
+                                async for ev in _yield_anthropic_events_serial(
+                                    assembler.feed(
+                                        content=content or None,
+                                        reasoning=reasoning or None,
+                                        tool_calls=tool_calls,
+                                    ),
+                                    client_gone=client_gone,
+                                ):
                                     yield ev
-                            async for ev in _yield_anthropic_events_serial(
-                                assembler.feed(
-                                    content=content or None,
-                                    reasoning=reasoning or None,
-                                    tool_calls=tool_calls,
-                                ),
-                                client_gone=client_gone,
-                            ):
-                                yield ev
                         if finish:
                             # Capture finish but keep reading — usage often
                             # arrives on a subsequent empty-choices chunk.
@@ -5857,16 +6005,43 @@ async def _stream_anthropic_with_failover_inner(
                     ):
                         fr = "tool_calls"
                     _note_success_once()
-                    if not stream_started:
-                        for ev in _open_anthropic_stream():
-                            yield ev
-                    async for ev in _yield_anthropic_events_serial(
-                        assembler.finish(
-                            fr, usage=usage, input_tokens=_ensure_prompt_est()
-                        ),
-                        client_gone=client_gone,
-                    ):
-                        yield ev
+                    # Soft disconnect still needs message_delta/stop after the
+                    # envelope opened. Skipping those frames is the intermittent
+                    # hard-cut that makes Claude Code stop scheduling. If we never
+                    # opened to the client, stay silent (no bare stop frames).
+                    try:
+                        if client_gone and not stream_started:
+                            pass
+                        else:
+                            if not stream_started:
+                                for ev in _open_anthropic_stream():
+                                    yield ev
+                            terminal_events = assembler.finish(
+                                fr, usage=usage, input_tokens=_ensure_prompt_est()
+                            )
+                            if client_gone:
+                                # Skip residual body deltas; always ship stop.
+                                for ev in terminal_events:
+                                    if (
+                                        '"type": "message_delta"' in ev
+                                        or '"type": "message_stop"' in ev
+                                        or '"type": "error"' in ev
+                                    ):
+                                        yield ev
+                            else:
+                                async for ev in _yield_anthropic_events_serial(
+                                    terminal_events,
+                                    client_gone=False,
+                                ):
+                                    yield ev
+                    except Exception:
+                        if stream_started:
+                            try:
+                                yield anth.anthropic_stream_error(
+                                    "client disconnected", err_type="api_error"
+                                )
+                            except Exception:
+                                pass
                     _record_usage_safe(
                         usage=_usage_from_body_and_output(
                             body,

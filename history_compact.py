@@ -52,11 +52,21 @@ HISTORY_MAX_TOOL_RESULT_CHARS = _env_int(
 HISTORY_MAX_MESSAGES_CHARS = _env_int(
     "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 280_000, minimum=8_000, maximum=5_000_000
 )
-# Max tools per assistant turn. Default 1: sub2api/Claude Code keep only one
-# active content_block; multi-tool frames still race to "Content block not found"
-# (especially Read) and agent frontends stop scheduling further turns.
-# Set higher only if the client is pure OpenAI; 0 = unlimited (not recommended).
+# Max tools per assistant turn for Claude-compatible paths
+# (/v1/messages, /v1/responses via sub2api). Default 1: sub2api/Claude Code keep
+# only one active content_block; multi-tool frames still race to
+# "Content block not found" (especially Read) and agent frontends stop scheduling.
+# 0 = unlimited.
 OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maximum=64)
+# Pure OpenAI chat/completions path default: unlimited (0). These clients can
+# schedule multiple tool_calls in one turn without content_block races.
+# Override with GROK2API_OUTBOUND_MAX_TOOLS_OPENAI if a secondary OpenAI relay
+# still needs a hard cap.
+OUTBOUND_MAX_TOOLS_OPENAI = _env_int(
+    "GROK2API_OUTBOUND_MAX_TOOLS_OPENAI", 0, minimum=0, maximum=64
+)
+
+
 # Real wall-clock gap between consecutive outbound tool SSE frames (seconds).
 # SSE comment keepalives alone are not enough: sub2api often drains a TCP window
 # of back-to-back tool chunks in one converter tick and still races content_blocks.
@@ -70,6 +80,19 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: floa
 
 
 OUTBOUND_TOOL_GAP_SEC = _env_float("GROK2API_OUTBOUND_TOOL_GAP_SEC", 0.08, minimum=0.0, maximum=2.0)
+
+
+def resolve_outbound_max_tools(protocol: str | None = None) -> int:
+    """Pick the per-turn tool cap for a public protocol.
+
+    - anthropic / openai_responses (sub2api): OUTBOUND_MAX_TOOLS (default 1)
+    - openai chat/completions: OUTBOUND_MAX_TOOLS_OPENAI (default 0 = unlimited)
+    """
+    proto = (protocol or "").strip().lower()
+    if proto in ("openai", "chat", "chat_completions", "openai_chat"):
+        return int(OUTBOUND_MAX_TOOLS_OPENAI)
+    # Default conservative: Claude / Responses / unknown secondary relays.
+    return int(OUTBOUND_MAX_TOOLS)
 
 
 _PLACEHOLDER_PREFIX = "[compacted tool result"
@@ -444,21 +467,51 @@ def compact_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
     return stats
 
 
-def cap_outbound_tools(tool_calls: list[Any] | None) -> list[Any] | None:
-    """Optional safety valve: limit tools emitted in one assistant response."""
-    if not tool_calls or OUTBOUND_MAX_TOOLS <= 0:
+def cap_outbound_tools(
+    tool_calls: list[Any] | None,
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
+) -> list[Any] | None:
+    """Optional safety valve: limit tools emitted in one assistant response.
+
+    ``max_tools`` wins when provided; else protocol-aware default; else global
+    OUTBOUND_MAX_TOOLS. 0 / negative → unlimited.
+    """
+    if not tool_calls:
         return tool_calls
-    if len(tool_calls) <= OUTBOUND_MAX_TOOLS:
+    limit = (
+        int(max_tools)
+        if max_tools is not None
+        else resolve_outbound_max_tools(protocol)
+        if protocol is not None
+        else int(OUTBOUND_MAX_TOOLS)
+    )
+    if limit <= 0:
         return tool_calls
-    return tool_calls[:OUTBOUND_MAX_TOOLS]
+    if len(tool_calls) <= limit:
+        return tool_calls
+    return tool_calls[:limit]
 
 
-def remaining_outbound_tool_budget(already_emitted: int) -> int | None:
+def remaining_outbound_tool_budget(
+    already_emitted: int,
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
+) -> int | None:
     """How many more tools may be shipped this turn.
 
-    None means unlimited (OUTBOUND_MAX_TOOLS <= 0). 0 means stop emitting.
+    None means unlimited (max_tools <= 0). 0 means stop emitting.
     """
-    if OUTBOUND_MAX_TOOLS <= 0:
+    limit = (
+        int(max_tools)
+        if max_tools is not None
+        else resolve_outbound_max_tools(protocol)
+        if protocol is not None
+        else int(OUTBOUND_MAX_TOOLS)
+    )
+    if limit <= 0:
         return None
-    left = OUTBOUND_MAX_TOOLS - max(0, int(already_emitted or 0))
+    left = limit - max(0, int(already_emitted or 0))
     return max(0, left)

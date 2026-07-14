@@ -43,25 +43,28 @@ def test_complete_tool_emits_midstream_when_required_keys_present() -> None:
 
 
 def test_terminal_flush_ships_parseable_json_without_required_keys() -> None:
-    """Mid-stream hold is strict; end-of-stream flushes parseable JSON objects."""
+    """Mid-stream hold is strict; end-of-stream flushes parseable JSON objects
+    for tools without a known required-key schema. Known incomplete Update is
+    still dropped to avoid wrong edits.
+    """
     s = r.ResponsesLiveStreamer(response_id="resp_b2", model="grok-4.5")
-    # Wrong key for Read (file_path required mid-stream) — hold during stream.
+    # Unknown custom tool with complete JSON — ship at terminal even if we have
+    # no required-key schema for it.
     frames = s.on_tool_delta(
         [
             {
                 "index": 0,
                 "id": "call_2",
                 "type": "function",
-                "function": {"name": "Read", "arguments": '{"path":"a.py"}'},
+                "function": {"name": "CustomTool", "arguments": '{"foo":"bar"}'},
             }
         ]
     )
-    assert frames == []
-    assert s._started is False
-    # Terminal flush still ships valid JSON so the turn is not empty HTTP 200.
+    # Custom tools with non-empty object are ready mid-stream too.
+    assert frames
+    assert s.has_client_payload() is True
     done = s.complete(force_flush_partial_tools=True)
     assert done
-    assert s.has_client_payload() is True
     assert any("response.completed" in x for x in done)
 
 
@@ -108,36 +111,109 @@ def test_incomplete_then_complete_same_tool() -> None:
 def test_local_fallback_holds_missing_required_keys() -> None:
     """Import-failure fallback must not open envelope on incomplete tool objects.
 
-    Loose JSON-only readiness used to emit Read with ``{"path":...}`` and lock
-    relays into empty/malformed HTTP 200 when the turn produced nothing else.
+    Alias normalization maps path→file_path, so Read with path is ready. Still
+    hold true incompletes (empty object / truncated JSON) so we never open
+    response.created on a turn that may end empty/malformed for Claude Code.
     """
-    assert r._local_tool_args_ready('{"path":"a.py"}', tool_name="Read") is False
+    # path is an alias of file_path — treat as ready after normalize.
+    assert r._local_tool_args_ready('{"path":"a.py"}', tool_name="Read") is True
     assert r._local_tool_args_ready('{"file_path":"a.py"}', tool_name="Read") is True
     assert r._local_tool_args_ready('{"command":"ls"}', tool_name="Bash") is True
     assert r._local_tool_args_ready("{}", tool_name="Bash") is False
     assert r._local_tool_args_ready('{"file_path":', tool_name="Read") is False
+    # Update without old/new must stay held.
+    assert (
+        r._local_tool_args_ready('{"file_path":"a.py"}', tool_name="Update")
+        is False
+    )
+    assert (
+        r._local_tool_args_ready(
+            '{"file_path":"a.py","old_string":"x","new_string":"y"}',
+            tool_name="Update",
+        )
+        is True
+    )
+    # camelCase aliases
+    assert (
+        r._local_tool_args_ready(
+            '{"filePath":"a.py","oldString":"x","newString":"y"}',
+            tool_name="Update",
+        )
+        is True
+    )
 
     s = r.ResponsesLiveStreamer(response_id="resp_fb", model="grok-4.5")
     s._args_ready = lambda args, *, tool_name=None: r._local_tool_args_ready(
         args or "", tool_name=tool_name
     )
+    # Incomplete Update (path only) must not open envelope mid-stream.
     frames = s.on_tool_delta(
         [
             {
                 "index": 0,
                 "id": "call_fb",
                 "type": "function",
-                "function": {"name": "Read", "arguments": '{"path":"a.py"}'},
+                "function": {"name": "Update", "arguments": '{"file_path":"a.py"}'},
             }
         ]
     )
     assert frames == []
     assert s.has_client_payload() is False
     assert s._started is False
-    # Terminal flush still ships parseable JSON even without mid-stream keys.
+    # Terminal flush must NOT ship schema-incomplete Update (wrong edit risk).
     done = s.complete(force_flush_partial_tools=True)
-    assert done
+    assert done == []
+    assert s.has_client_payload() is False
+
+
+def test_update_doubled_json_prefers_richer_object() -> None:
+    """Grok sometimes emits partial+full Update args in one SSE chunk."""
+    partial_full = (
+        '{"file_path":"/x.py"}'
+        '{"file_path":"/x.py","old_string":"a","new_string":"b"}'
+    )
+    # Local sanitize (import-safe path)
+    out = r._local_sanitize_tool_arguments_json(partial_full)
+    assert "old_string" in out and "new_string" in out
+    assert r._local_tool_args_ready(out, tool_name="Update") is True
+
+    s = r.ResponsesLiveStreamer(response_id="resp_upd", model="grok-4.5")
+    frames = s.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_u1",
+                "type": "function",
+                "function": {"name": "Update", "arguments": partial_full},
+            }
+        ]
+    )
+    assert frames
     assert s.has_client_payload() is True
+    # Emitted arguments should include old/new, not just file_path.
+    blob = "".join(frames)
+    assert "old_string" in blob and "new_string" in blob
+
+
+def test_update_alias_keys_ready() -> None:
+    s = r.ResponsesLiveStreamer(response_id="resp_alias", model="grok-4.5")
+    frames = s.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_alias",
+                "type": "function",
+                "function": {
+                    "name": "Update",
+                    "arguments": '{"path":"/x.py","oldString":"a","newString":"b"}',
+                },
+            }
+        ]
+    )
+    assert frames
+    blob = "".join(frames)
+    assert "file_path" in blob or "path" in blob
+    assert "old_string" in blob or "oldString" in blob
 
 
 def test_classify_upstream_body_error_empty_and_gateway() -> None:

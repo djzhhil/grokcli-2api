@@ -55,6 +55,32 @@ _LOCAL_TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "web_search": ("query",),
 }
 
+_LOCAL_TOOL_ARG_KEY_ALIASES: dict[str, str] = {
+    "path": "file_path",
+    "filepath": "file_path",
+    "file": "file_path",
+    "filename": "file_path",
+    "oldstring": "old_string",
+    "oldstr": "old_string",
+    "oldtext": "old_string",
+    "old": "old_string",
+    "newstring": "new_string",
+    "newstr": "new_string",
+    "newtext": "new_string",
+    "new": "new_string",
+    "notebookpath": "notebook_path",
+    "notebook": "notebook_path",
+    "cmd": "command",
+    "shell_command": "command",
+    "q": "query",
+    "search": "query",
+    "search_query": "query",
+    "uri": "url",
+    "href": "url",
+    "regex": "pattern",
+    "glob_pattern": "pattern",
+}
+
 
 def _local_tool_name_key(name: str | None) -> str:
     import re
@@ -74,6 +100,193 @@ def _local_required_keys_for_tool(name: str | None) -> tuple[str, ...]:
     return ()
 
 
+def _local_canonical_tool_arg_key(key: str) -> str:
+    import re
+
+    raw = str(key or "").strip()
+    if not raw:
+        return raw
+    folded_keep_us = re.sub(r"[^a-z0-9_]+", "", raw.lower())
+    folded_alnum = folded_keep_us.replace("_", "")
+    if folded_keep_us in _LOCAL_TOOL_ARG_KEY_ALIASES:
+        return _LOCAL_TOOL_ARG_KEY_ALIASES[folded_keep_us]
+    if folded_alnum in _LOCAL_TOOL_ARG_KEY_ALIASES:
+        return _LOCAL_TOOL_ARG_KEY_ALIASES[folded_alnum]
+    return raw
+
+
+def _local_normalize_tool_arg_keys(obj: Any) -> Any:
+    if not isinstance(obj, dict):
+        return obj
+    out: dict[str, Any] = {}
+    for k, v in obj.items():
+        canon = _local_canonical_tool_arg_key(str(k))
+        if canon in out:
+            old = out.get(canon)
+            if old in (None, "", [], {}) and v not in (None, "", [], {}):
+                out[canon] = v
+            continue
+        out[canon] = v
+    return out
+
+
+def _local_tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
+    if isinstance(value, dict):
+        non_empty = 0
+        for v in value.values():
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if isinstance(v, (list, dict)) and not v:
+                continue
+            non_empty += 1
+        try:
+            nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            nbytes = len(str(value))
+        return (3, len(value), non_empty, nbytes)
+    if isinstance(value, list):
+        try:
+            nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            nbytes = len(str(value))
+        return (2, len(value), 0, nbytes)
+    if value is None:
+        return (0, 0, 0, 0)
+    text = str(value)
+    return (1, 1 if text.strip() else 0, 0, len(text))
+
+
+def _local_merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
+    dicts = [v for v in values if isinstance(v, dict)]
+    if not dicts:
+        return None
+    merged: dict[str, Any] = {}
+    for d in dicts:
+        for k, v in d.items():
+            if k not in merged:
+                merged[k] = v
+                continue
+            old = merged.get(k)
+            if old in (None, "", [], {}):
+                merged[k] = v
+            elif isinstance(old, dict) and isinstance(v, dict):
+                tmp = dict(old)
+                tmp.update(v)
+                merged[k] = tmp
+            elif isinstance(old, list) and isinstance(v, list) and len(v) >= len(old):
+                merged[k] = v
+            elif v not in (None, "", [], {}):
+                merged[k] = v
+    return merged
+
+
+def _local_sanitize_tool_arguments_json(raw: Any) -> str:
+    """Import-safe mirror of anthropic_compat.sanitize_tool_arguments_json."""
+    if raw is None:
+        return ""
+    if isinstance(raw, (dict, list)):
+        try:
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(raw)
+    if not isinstance(raw, str):
+        try:
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(raw)
+    s = raw
+    if not s:
+        return ""
+    try:
+        json.loads(s)
+        return s
+    except json.JSONDecodeError:
+        pass
+    stripped = s.strip()
+    if stripped and stripped != s:
+        try:
+            json.loads(stripped)
+            return stripped
+        except json.JSONDecodeError:
+            pass
+    decoder = json.JSONDecoder()
+    src = stripped or s
+    idx = 0
+    n = len(src)
+    values: list[Any] = []
+    ends: list[int] = []
+    while idx < n:
+        while idx < n and src[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(src, idx)
+        except json.JSONDecodeError:
+            break
+        values.append(obj)
+        ends.append(end)
+        idx = end
+    if len(values) < 2:
+        return s
+    first = values[0]
+    first_text = src[: ends[0]].strip()
+    if all(v == first for v in values[1:]):
+        return first_text
+    merged = _local_merge_tool_arg_dicts(values)
+    candidates: list[tuple[tuple[int, int, int, int], str]] = []
+    if merged is not None:
+        try:
+            merged_text = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+            candidates.append((_local_tool_arg_value_score(merged), merged_text))
+        except (TypeError, ValueError):
+            pass
+    for i, v in enumerate(values):
+        try:
+            if i == 0:
+                text = first_text
+            else:
+                start = ends[i - 1]
+                while start < ends[i] and src[start].isspace():
+                    start += 1
+                text = src[start : ends[i]].strip()
+                if not text:
+                    text = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            candidates.append((_local_tool_arg_value_score(v), text))
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        return first_text
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _local_normalize_tool_arguments_json(
+    raw: Any, *, tool_name: str | None = None
+) -> str:
+    cleaned = _local_sanitize_tool_arguments_json(raw)
+    if not cleaned or not str(cleaned).strip():
+        return cleaned
+    text = str(cleaned).strip()
+    if text[0] not in "{[":
+        return cleaned
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return cleaned
+    if not isinstance(parsed, dict):
+        return cleaned
+    normalized = _local_normalize_tool_arg_keys(parsed)
+    if normalized == parsed:
+        return cleaned
+    try:
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return cleaned
+
+
 def _local_tool_args_ready(args: str, *, tool_name: str | None = None) -> bool:
     """Import-safe readiness gate matching anthropic_compat rules.
 
@@ -81,7 +294,8 @@ def _local_tool_args_ready(args: str, *, tool_name: str | None = None) -> bool:
     (missing required keys) must stay held so we never open response.created
     on a turn that may end empty/malformed for Claude Code.
     """
-    text = str(args or "").strip()
+    text = _local_normalize_tool_arguments_json(args, tool_name=tool_name)
+    text = str(text or "").strip()
     if not text or text[0] not in "{[":
         return False
     try:
@@ -1164,10 +1378,10 @@ class ResponsesLiveStreamer:
         try:
             import anthropic_compat as anth
 
+            # Normalize aliases (path/oldString) before readiness.
+            norm = anth.normalize_tool_arguments_json(args or "", tool_name=tool_name)
             return bool(
-                anth.is_complete_tool_arguments_json(
-                    args or "", tool_name=tool_name
-                )
+                anth.is_complete_tool_arguments_json(norm or "", tool_name=tool_name)
             )
         except Exception:
             return _local_tool_args_ready(args or "", tool_name=tool_name)
@@ -1205,6 +1419,15 @@ class ResponsesLiveStreamer:
                 if slot.get("call_id") or str(args).strip():
                     break
                 continue
+            # Normalize aliases before readiness/emission so Update/Edit keys
+            # match Claude Code schema even if the model used path/oldString.
+            try:
+                import anthropic_compat as anth
+
+                args = anth.normalize_tool_arguments_json(args, tool_name=name)
+            except Exception:
+                args = _local_normalize_tool_arguments_json(args, tool_name=name)
+            slot["arguments"] = args
             if not self._args_ready(args, tool_name=name):
                 # Hold partial objects (e.g. Update with only file_path).
                 break
@@ -1290,7 +1513,12 @@ class ResponsesLiveStreamer:
             return False
         args = slot.get("arguments") or ""
         if terminal:
-            return self._terminal_args(args if isinstance(args, str) else str(args)) is not None
+            return (
+                self._terminal_args(
+                    args if isinstance(args, str) else str(args), tool_name=name
+                )
+                is not None
+            )
         return self._args_ready(args, tool_name=name)
 
     def _any_shipable_tool(self, *, terminal: bool = False) -> bool:
@@ -1401,14 +1629,26 @@ class ResponsesLiveStreamer:
         self._text_open = False
         return frames
 
-    def _terminal_args(self, args: str) -> str | None:
+    def _terminal_args(self, args: str, *, tool_name: str | None = None) -> str | None:
         """Normalize tool args for end-of-stream flush.
 
         Returns None when args are truncated non-JSON (unsafe to ship).
-        Empty args become ``{}``. Complete JSON objects/arrays pass through even
-        when mid-stream required-key checks would still hold them.
+        Empty args become ``{}``. Complete JSON objects/arrays pass through only
+        when they satisfy mid-stream required-key rules for known tools
+        (Update/Edit must not ship file_path-only). Unknown tools still flush
+        any parseable object so the turn is not empty HTTP 200.
         """
-        text = str(args or "").strip()
+        try:
+            import anthropic_compat as anth
+
+            text = anth.normalize_tool_arguments_json(
+                args or "", tool_name=tool_name
+            )
+        except Exception:
+            text = _local_normalize_tool_arguments_json(
+                args or "", tool_name=tool_name
+            )
+        text = str(text or "").strip()
         if not text:
             return "{}"
         if text[0] not in "{[":
@@ -1419,7 +1659,20 @@ class ResponsesLiveStreamer:
             return None
         if not isinstance(parsed, (dict, list)):
             return None
-        # Empty containers are OK at terminal flush (better than silent empty turn).
+        # Known schema incomplete → refuse terminal flush (prefer failover /
+        # empty turn over a wrong Update with only a path).
+        try:
+            import anthropic_compat as anth
+
+            if not anth.is_complete_tool_arguments_json(text, tool_name=tool_name):
+                required = anth._required_keys_for_tool(tool_name)  # type: ignore[attr-defined]
+                if required:
+                    return None
+        except Exception:
+            if not _local_tool_args_ready(text, tool_name=tool_name):
+                required = _local_required_keys_for_tool(tool_name)
+                if required:
+                    return None
         return text
 
     def _close_open_tools(self) -> list[str]:
@@ -1442,9 +1695,11 @@ class ResponsesLiveStreamer:
                 continue
             if not name:
                 continue
-            term_args = self._terminal_args(args if isinstance(args, str) else str(args))
+            term_args = self._terminal_args(
+                args if isinstance(args, str) else str(args), tool_name=name
+            )
             if term_args is None:
-                # Truncated stream (e.g. '{"path":') — do not ship garbage.
+                # Truncated / schema-incomplete — do not ship garbage Update.
                 continue
             args = term_args
             slot["arguments"] = args
