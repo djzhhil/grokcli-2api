@@ -13,8 +13,10 @@ Providers:
 from __future__ import annotations
 
 import email
+import os
 import random
 import re
+import time
 from email import policy
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -340,23 +342,56 @@ def moemail_create_mailbox(
     if name:
         payload["name"] = name
 
+    # Bulk registration fans out mailbox creates; MoeMail occasionally returns
+    # 502/503/429 under load. Retry transient failures instead of failing the job.
+    try:
+        max_attempts = max(
+            1,
+            min(8, int(os.environ.get("GROK2API_MOEMAIL_CREATE_RETRIES", "4") or 4)),
+        )
+    except (TypeError, ValueError):
+        max_attempts = 4
+    last_err = ""
+    data: dict[str, Any] | None = None
     with httpx.Client(timeout=30.0) as client:
         headers = {**_headers(api_key), "Content-Type": "application/json"}
-        resp = client.post(f"{base}/api/emails/generate", json=payload, headers=headers)
-        if resp.status_code == 400 and "域名" in resp.text and not domain:
-            inferred = _moemail_infer_domain(client, base, api_key=api_key)
-            if inferred and inferred != payload.get("domain"):
-                payload["domain"] = inferred
+        for attempt in range(1, max_attempts + 1):
+            try:
                 resp = client.post(
                     f"{base}/api/emails/generate",
                     json=payload,
                     headers=headers,
                 )
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"MoeMail create failed {resp.status_code}: {resp.text[:500]}"
-            )
-        data = resp.json()
+                if resp.status_code == 400 and "域名" in resp.text and not domain:
+                    inferred = _moemail_infer_domain(client, base, api_key=api_key)
+                    if inferred and inferred != payload.get("domain"):
+                        payload["domain"] = inferred
+                        resp = client.post(
+                            f"{base}/api/emails/generate",
+                            json=payload,
+                            headers=headers,
+                        )
+                if resp.status_code >= 400:
+                    last_err = (
+                        f"MoeMail create failed {resp.status_code}: {resp.text[:500]}"
+                    )
+                    transient = resp.status_code in {408, 425, 429, 500, 502, 503, 504}
+                    if transient and attempt < max_attempts:
+                        time.sleep(min(12.0, 0.8 * attempt + random.uniform(0.1, 0.6)))
+                        continue
+                    raise RuntimeError(last_err)
+                data = resp.json()
+                break
+            except RuntimeError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_err = f"MoeMail create network error: {e}"
+                if attempt < max_attempts:
+                    time.sleep(min(12.0, 0.8 * attempt + random.uniform(0.1, 0.6)))
+                    continue
+                raise RuntimeError(last_err) from e
+    if not isinstance(data, dict):
+        raise RuntimeError(last_err or "MoeMail create failed")
 
     email_id = data.get("id") or data.get("emailId")
     address = data.get("email") or data.get("address")

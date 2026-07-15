@@ -123,18 +123,37 @@ def _local_canonical_tool_arg_key(key: str) -> str:
 
 
 def _local_normalize_tool_arg_keys(obj: Any) -> Any:
+    """Mirror of anthropic_compat.normalize_tool_argument_keys.
+
+    Canonical keys (``file_path``) beat aliases (``path`` / ``filepath``) so
+    Update/Edit stream merges cannot open the wrong file.
+    """
     if not isinstance(obj, dict):
         return obj
-    out: dict[str, Any] = {}
+
+    def _empty(value: Any) -> bool:
+        return value in (None, "", [], {})
+
+    chosen: dict[str, tuple[Any, bool]] = {}
     for k, v in obj.items():
-        canon = _local_canonical_tool_arg_key(str(k))
-        if canon in out:
-            old = out.get(canon)
-            if old in (None, "", [], {}) and v not in (None, "", [], {}):
-                out[canon] = v
+        raw = str(k)
+        canon = _local_canonical_tool_arg_key(raw)
+        from_canon = raw == canon
+        if canon not in chosen:
+            chosen[canon] = (v, from_canon)
             continue
-        out[canon] = v
-    return out
+        old_v, old_canon = chosen[canon]
+        if _empty(old_v) and not _empty(v):
+            chosen[canon] = (v, from_canon)
+            continue
+        if _empty(v):
+            continue
+        if from_canon and not old_canon:
+            chosen[canon] = (v, True)
+            continue
+        if old_canon and not from_canon:
+            continue
+    return {k: v for k, (v, _) in chosen.items()}
 
 
 def _local_tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:

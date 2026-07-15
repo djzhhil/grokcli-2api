@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-15-global-inflight-1"
+ADAPTER_BUILD = "v1.9.80-reg-sso-sticky-runner-fix"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -99,6 +99,11 @@ _global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
 # new job admission without killing already-running workers.
 _reg_soft_pause_until = 0.0
 _reg_soft_pause_lock = threading.Lock()
+# Mid-run self-heal: startup reclaim alone cannot rescue a dead runner while the
+# process stays up. Watchdog refreshes Redis TTL and auto-resumes unfinished
+# batches whose spawner disappeared mid-flight (common on multi-hour bulk jobs).
+_reg_watchdog_started = False
+_reg_watchdog_lock = threading.Lock()
 _xconsole_ready = False
 _xconsole_error: str | None = None
 
@@ -146,10 +151,41 @@ def _release_reg_admission() -> None:
     except Exception:
         pass
 
+
+def _release_reg_admission_once(flag: dict[str, bool]) -> None:
+    """Idempotent admission release (safe to call from job + post-import probe)."""
+    if not isinstance(flag, dict):
+        return
+    if flag.get("released"):
+        return
+    flag["released"] = True
+    _release_reg_admission()
+
+
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
 # cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
 REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
+try:
+    REG_WATCHDOG_SEC = max(
+        15.0,
+        min(
+            600.0,
+            float(os.environ.get("GROK2API_REG_WATCHDOG_SEC", "45") or 45),
+        ),
+    )
+except (TypeError, ValueError):
+    REG_WATCHDOG_SEC = 45.0
+try:
+    REG_WATCHDOG_STALE_SEC = max(
+        30.0,
+        min(
+            3600.0,
+            float(os.environ.get("GROK2API_REG_WATCHDOG_STALE_SEC", "180") or 180),
+        ),
+    )
+except (TypeError, ValueError):
+    REG_WATCHDOG_STALE_SEC = 180.0
 
 
 def _now() -> float:
@@ -392,44 +428,122 @@ def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _merge_reg_remote(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
+    """Prefer Redis when it is newer; keep process-only ``_`` fields from local."""
+    merged = {**local, **remote}
+    for k, v in local.items():
+        if isinstance(k, str) and k.startswith("_") and k not in remote:
+            merged[k] = v
+    return merged
+
+
 def _load_reg_sess(sid: str) -> dict[str, Any] | None:
+    """Load a registration session, always refreshing from Redis when newer.
+
+    Multi-worker note: the admin poll often lands on a different process than
+    the registration worker. Returning local cache blindly freezes the UI
+    progress log until that worker happens to serve the request.
+    """
     with _lock:
         local = _sessions.get(sid)
-        if local is not None:
-            return local
-    if not _reg_redis():
-        return None
-    try:
-        from store import sessions_redis
+    remote = None
+    if _reg_redis():
+        try:
+            from store import sessions_redis
 
-        remote = sessions_redis.reg_sess_get(sid)
-        if remote:
-            with _lock:
-                _sessions.setdefault(sid, remote)
-            return remote
-    except Exception:
-        pass
-    return None
+            remote = sessions_redis.reg_sess_get(sid)
+            if remote is not None and not isinstance(remote, dict):
+                remote = None
+        except Exception:
+            remote = None
+
+    if local is None and remote is None:
+        return None
+    if local is None:
+        with _lock:
+            cur = _sessions.get(sid)
+            if cur is not None:
+                local_ts = float(cur.get("updated_at") or 0)
+                remote_ts = float((remote or {}).get("updated_at") or 0)
+                if remote is not None and remote_ts > local_ts:
+                    merged = _merge_reg_remote(cur, remote)
+                    _sessions[sid] = merged
+                    return merged
+                return cur
+            _sessions[sid] = remote  # type: ignore[assignment]
+        return remote
+    if remote is None:
+        return local
+
+    local_ts = float(local.get("updated_at") or 0)
+    remote_ts = float(remote.get("updated_at") or 0)
+    if remote_ts > local_ts:
+        with _lock:
+            cur = _sessions.get(sid) or local
+            cur_ts = float(cur.get("updated_at") or 0)
+            remote_ts2 = float(remote.get("updated_at") or 0)
+            if remote_ts2 > cur_ts:
+                merged = _merge_reg_remote(cur, remote)
+                _sessions[sid] = merged
+                return merged
+            return cur
+    return local
 
 
 def _load_reg_batch(batch_id: str) -> dict[str, Any] | None:
+    """Load a registration batch, refreshing from Redis when newer."""
     with _lock:
         local = _batches.get(batch_id)
-        if local is not None:
-            return local
-    if not _reg_redis():
-        return None
-    try:
-        from store import sessions_redis
+    remote = None
+    if _reg_redis():
+        try:
+            from store import sessions_redis
 
-        remote = sessions_redis.reg_batch_get(batch_id)
-        if remote:
-            with _lock:
-                _batches.setdefault(batch_id, remote)
-            return remote
-    except Exception:
-        pass
-    return None
+            remote = sessions_redis.reg_batch_get(batch_id)
+            if remote is not None and not isinstance(remote, dict):
+                remote = None
+        except Exception:
+            remote = None
+
+    if local is None and remote is None:
+        return None
+    if local is None:
+        with _lock:
+            cur = _batches.get(batch_id)
+            if cur is not None:
+                local_ts = float(cur.get("updated_at") or 0)
+                remote_ts = float((remote or {}).get("updated_at") or 0)
+                if remote is not None and remote_ts > local_ts:
+                    ids = list(cur.get("session_ids") or [])
+                    for x in remote.get("session_ids") or []:
+                        if x not in ids:
+                            ids.append(x)
+                    merged = {**cur, **remote, "session_ids": ids}
+                    _batches[batch_id] = merged
+                    return merged
+                return cur
+            _batches[batch_id] = remote  # type: ignore[assignment]
+        return remote
+    if remote is None:
+        return local
+
+    local_ts = float(local.get("updated_at") or 0)
+    remote_ts = float(remote.get("updated_at") or 0)
+    if remote_ts > local_ts:
+        with _lock:
+            cur = _batches.get(batch_id) or local
+            cur_ts = float(cur.get("updated_at") or 0)
+            remote_ts2 = float(remote.get("updated_at") or 0)
+            if remote_ts2 > cur_ts:
+                ids = list(cur.get("session_ids") or [])
+                for x in remote.get("session_ids") or []:
+                    if x not in ids:
+                        ids.append(x)
+                merged = {**cur, **remote, "session_ids": ids}
+                _batches[batch_id] = merged
+                return merged
+            return cur
+    return local
 
 
 def _clean_old_sessions() -> None:
@@ -878,6 +992,7 @@ def _make_email_receiver(
             *,
             should_cancel=None,
             poll_interval: float | None = None,
+            on_tick=None,
         ) -> str:
             import re as _re
 
@@ -885,6 +1000,8 @@ def _make_email_receiver(
             # Keep polls short so cooperative cancel can land quickly.
             poll = float(poll_interval if poll_interval is not None else 1.0)
             poll = max(0.4, min(poll, 2.0))
+            started = time.time()
+            last_tick = 0.0
             while time.time() < deadline:
                 if callable(should_cancel) and should_cancel():
                     raise _RegCancelled("cancelled while waiting for email code")
@@ -934,6 +1051,17 @@ def _make_email_receiver(
                                 return clean
                 except Exception:
                     pass
+                # Heartbeat for admin UI so waiting_email is not a silent freeze.
+                now = time.time()
+                if callable(on_tick) and (now - last_tick) >= 2.0:
+                    last_tick = now
+                    try:
+                        on_tick(
+                            elapsed=max(0.0, now - started),
+                            remaining=max(0.0, deadline - now),
+                        )
+                    except Exception:
+                        pass
                 # Sleep in small slices so stop can interrupt mid-wait.
                 slept = 0.0
                 while slept < poll:
@@ -1415,6 +1543,7 @@ def start_registration(
     )
     if not started.get("ok"):
         return started
+    _ensure_registration_watchdog()
 
     # Brief wait so the first wave (up to `workers`) is usually visible to UI.
     time.sleep(min(0.45, 0.08 * workers + 0.08))
@@ -1768,6 +1897,7 @@ def _spawn_batch_runner(
             # Cross-batch admission control: many resumed batches otherwise all
             # run concurrency=8 and overwhelm local captcha + device-flow.
             admitted = False
+            admission_flag = {"released": False}
             try:
                 def _job_cancel() -> None:
                     with _lock:
@@ -1781,7 +1911,13 @@ def _spawn_batch_runner(
 
                 _wait_reg_admission(check_cancel=_job_cancel)
                 admitted = True
-                _run_registration(sid, key, job_proxy or "", receiver)
+                _run_registration(
+                    sid,
+                    key,
+                    job_proxy or "",
+                    receiver,
+                    admission_flag=admission_flag,
+                )
             except _RegCancelled as e:
                 with _lock:
                     if sid in _sessions:
@@ -1798,7 +1934,7 @@ def _spawn_batch_runner(
                 }
             finally:
                 if admitted:
-                    _release_reg_admission()
+                    _release_reg_admission_once(admission_flag)
                 with _lock:
                     if sid in _sessions:
                         _sessions[sid].pop("_receiver", None)
@@ -2003,6 +2139,7 @@ def _run_registration(
     yescaptcha_key: str,
     proxy: str,
     receiver: Any,
+    admission_flag: dict[str, bool] | None = None,
 ) -> None:
     with _lock:
         sess = _sessions.get(sid)
@@ -2269,8 +2406,40 @@ def _run_registration(
                 "premium": use_premium,
                 "fallback_non_premium": True,
             }
-            if provider == "local":
-                with _local_captcha_lock:
+            if provider != "local":
+                return solver.solve_turnstile(**kwargs)
+
+            # Local path: do NOT block the whole worker silently under the lock.
+            # Bulk (>=600) jobs easily queue for minutes; reclaim previously
+            # killed those sessions after ~180s of no heartbeat.
+            wait_started = time.time()
+            last_beat = 0.0
+            while True:
+                _check_cancel()
+                acquired = _local_captcha_lock.acquire(timeout=5.0)
+                if not acquired:
+                    waited = time.time() - wait_started
+                    if waited - last_beat >= 15.0:
+                        last_beat = waited
+                        update(
+                            "solving_turnstile",
+                            f"queued for local Turnstile ({int(waited)}s) "
+                            f"[{ADAPTER_BUILD}]",
+                        )
+                    continue
+                try:
+                    waited = time.time() - wait_started
+                    if waited >= 1.0:
+                        update(
+                            "solving_turnstile",
+                            f"solving Turnstile via {solver_label} "
+                            f"(after {int(waited)}s queue) [{ADAPTER_BUILD}]",
+                        )
+                    else:
+                        update(
+                            "solving_turnstile",
+                            f"solving Turnstile via {solver_label} (before email code)",
+                        )
                     _check_cancel()
                     try:
                         return solver.solve_turnstile(**kwargs)
@@ -2291,7 +2460,11 @@ def _run_registration(
                         ):
                             _note_reg_pressure(f"local captcha: {e}")
                         raise
-            return solver.solve_turnstile(**kwargs)
+                finally:
+                    try:
+                        _local_captcha_lock.release()
+                    except Exception:
+                        pass
 
         try:
             # Local: Proxyless only. Remote YesCaptcha: premium M1 first.
@@ -2334,16 +2507,26 @@ def _run_registration(
             _check_cancel()
             return False
 
+        def _mail_on_tick(*, elapsed: float = 0.0, remaining: float = 0.0, **_kw) -> None:
+            # Heartbeat keeps admin progress log fresh during long mailbox waits.
+            update(
+                "waiting_email",
+                f"waiting for xAI verification code · {int(elapsed)}s elapsed"
+                + (f", {int(remaining)}s left" if remaining else ""),
+            )
+
         try:
             code = receiver.wait_for_code(
                 timeout=120.0,
                 should_cancel=_mail_should_cancel,
                 poll_interval=1.0,
+                on_tick=_mail_on_tick,
             )
         except TypeError:
-            # Older receiver signature fallback.
+            # Older receiver signature fallback (no on_tick / should_cancel).
             code = None
             mail_deadline = time.time() + 120.0
+            mail_started = time.time()
             while time.time() < mail_deadline:
                 _check_cancel()
                 try:
@@ -2354,6 +2537,10 @@ def _run_registration(
                     code = None
                 if code:
                     break
+                _mail_on_tick(
+                    elapsed=time.time() - mail_started,
+                    remaining=max(0.0, mail_deadline - time.time()),
+                )
         if not code:
             raise RuntimeError("email verification code timeout")
         code = str(code or "").strip().upper().replace(" ", "").replace("-", "")
@@ -2392,7 +2579,15 @@ def _run_registration(
                 try:
                     client.create_email_validation_code(email)
                     update("waiting_email", "waiting for fresh xAI verification code")
-                    code = receiver.wait_for_code(timeout=120)
+                    try:
+                        code = receiver.wait_for_code(
+                            timeout=120,
+                            should_cancel=_mail_should_cancel,
+                            poll_interval=1.0,
+                            on_tick=_mail_on_tick,
+                        )
+                    except TypeError:
+                        code = receiver.wait_for_code(timeout=120)
                     code = (
                         str(code or "")
                         .strip()
@@ -2502,14 +2697,26 @@ def _run_registration(
             "fetching_sso",
             f"create_account HTTP {http_status} accepted; extracting SSO [{ADAPTER_BUILD}]",
         )
+        # Mark that xAI accepted create_account. Even if SSO extraction fails,
+        # the mailbox is usually consumed and the remote account may already exist.
+        try:
+            sess["account_created"] = True
+            sess["create_http_status"] = http_status
+            sess["create_ok"] = bool(getattr(res, "ok", False))
+        except Exception:
+            pass
 
         sso = None
+        sso_attempts: list[str] = []
         try:
             sso = client.fetch_sso_token(
-                email=email, password=password, save=True, retries=4
+                email=email, password=password, save=True, retries=5
             )
+            if sso:
+                sso_attempts.append("fetch_sso_token")
         except Exception as sso_fetch_err:  # noqa: BLE001
             print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
+            sso_attempts.append(f"fetch_sso_token_err:{sso_fetch_err}")
 
         if not sso:
             try:
@@ -2524,6 +2731,8 @@ def _run_registration(
                 sso = parse_sso_from_set_cookies(sc) or parse_sso_token_from_text(
                     rsc_body
                 )
+                if sso:
+                    sso_attempts.append("parse_set_cookie_or_rsc")
                 if not sso and rsc_body:
                     print(
                         f"[grok-build-auth] set-cookie candidates="
@@ -2542,60 +2751,126 @@ def _run_registration(
                     sso = extractor.extract(
                         rsc_body, email=email, password=password, save=False
                     )
+                    if sso:
+                        sso_attempts.append("SSOExtractor")
             except Exception as recover_err:  # noqa: BLE001
                 print(f"[grok-build-auth] SSO recover failed: {recover_err}")
+                sso_attempts.append(f"rsc_recover_err:{recover_err}")
 
         # Current xAI create_account often returns only RSC chunks + CF cookies,
         # with no set-cookie JWT chain. Fall back to password CreateSession and
         # treat the returned session JWT as the sso cookie for sso_to_auth_json.
+        #
+        # Bulk registration hits a race: account is created (HTTP 200) but not
+        # yet visible to CreateSession for a few seconds. Multi-round login with
+        # fresh turnstile + propagation backoff recovers most SSO_COOKIE_MISSING.
         if not sso:
+            try:
+                sso_rounds = max(
+                    1,
+                    min(
+                        8,
+                        int(os.environ.get("GROK2API_REG_SSO_LOGIN_ROUNDS", "4") or 4),
+                    ),
+                )
+            except (TypeError, ValueError):
+                sso_rounds = 4
+            try:
+                sso_prop_sec = max(
+                    0.5,
+                    min(
+                        20.0,
+                        float(
+                            os.environ.get("GROK2API_REG_SSO_PROPAGATE_SEC", "3.5")
+                            or 3.5
+                        ),
+                    ),
+                )
+            except (TypeError, ValueError):
+                sso_prop_sec = 3.5
+
             update(
                 "fetching_sso",
-                f"RSC has no sso chain; CreateSession password fallback [{ADAPTER_BUILD}]",
+                f"RSC has no sso chain; CreateSession password fallback "
+                f"rounds={sso_rounds} [{ADAPTER_BUILD}]",
             )
-            try:
-                # Fresh turnstile for sign-in page improves CreateSession success.
-                # Allow account propagation delay before first login attempt.
-                time.sleep(2.0)
-                signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
-                try:
-                    signin_turnstile = _solve_turnstile(
-                        signin_url, premium=(provider != "local")
-                    )
-                except Exception:
-                    signin_turnstile = turnstile
-                sso = client.obtain_session_via_password(
-                    email=email,
-                    password=password,
-                    turnstile_token=signin_turnstile,
-                    referer=signin_url,
-                    retries=4,
+            signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
+            # Initial propagation wait before first login attempt.
+            time.sleep(sso_prop_sec)
+            for round_i in range(1, sso_rounds + 1):
+                _check_cancel()
+                if sso:
+                    break
+                update(
+                    "fetching_sso",
+                    f"CreateSession password fallback "
+                    f"{round_i}/{sso_rounds} [{ADAPTER_BUILD}]",
                 )
-                # One more captcha + login if first CreateSession returned empty.
-                if not sso:
+                try:
+                    # Alternate premium/non-premium for remote captcha; local is
+                    # always proxyless. Round 1 prefers premium when available.
+                    use_premium = (provider != "local") and (round_i % 2 == 1)
                     try:
-                        signin_turnstile = _solve_turnstile(signin_url, premium=False)
-                        time.sleep(1.5)
+                        signin_turnstile = _solve_turnstile(
+                            signin_url, premium=use_premium
+                        )
+                    except Exception as ts_err:  # noqa: BLE001
+                        print(
+                            f"[grok-build-auth] sign-in turnstile round "
+                            f"{round_i} failed: {ts_err}"
+                        )
+                        # Reuse signup token only as last resort on first round.
+                        signin_turnstile = turnstile if round_i == 1 else None
+                    if not signin_turnstile:
+                        sso_attempts.append(f"round{round_i}:no_turnstile")
+                        time.sleep(min(8.0, sso_prop_sec + round_i))
+                        continue
+                    try:
                         sso = client.obtain_session_via_password(
                             email=email,
                             password=password,
                             turnstile_token=signin_turnstile,
                             referer=signin_url,
-                            retries=2,
+                            retries=max(2, 5 - round_i // 2),
                         )
-                    except Exception as cs2_err:  # noqa: BLE001
+                    except Exception as cs_err:  # noqa: BLE001
                         print(
-                            f"[grok-build-auth] CreateSession second pass failed: {cs2_err}"
+                            f"[grok-build-auth] CreateSession round "
+                            f"{round_i} failed: {cs_err}"
                         )
-                print(
-                    f"[grok-build-auth] CreateSession fallback sso="
-                    f"{(sso[:60] if sso else None)}"
-                )
-            except Exception as cs_err:  # noqa: BLE001
-                print(f"[grok-build-auth] CreateSession fallback failed: {cs_err}")
+                        sso_attempts.append(f"round{round_i}:err:{cs_err}")
+                        sso = None
+                    if sso:
+                        sso_attempts.append(f"CreateSession:round{round_i}")
+                        break
+                    sso_attempts.append(f"round{round_i}:empty")
+                except _RegCancelled:
+                    raise
+                except Exception as cs_loop_err:  # noqa: BLE001
+                    print(
+                        f"[grok-build-auth] CreateSession loop "
+                        f"{round_i} error: {cs_loop_err}"
+                    )
+                    sso_attempts.append(f"round{round_i}:loop_err:{cs_loop_err}")
+                # Backoff so newly created accounts become visible / rate limits cool.
+                time.sleep(min(12.0, sso_prop_sec + round_i * 1.5))
+
+            # Final jar scrape in case a late set-cookie landed.
+            if not sso:
+                try:
+                    sso = client._read_sso_from_jar()  # noqa: SLF001
+                    if sso:
+                        sso_attempts.append("cookie_jar_final")
+                except Exception:
+                    pass
+            print(
+                f"[grok-build-auth] CreateSession fallback sso="
+                f"{(sso[:60] if sso else None)} attempts={sso_attempts}"
+            )
 
         print(f"[grok-build-auth] fetch_sso_token result: {sso[:60] if sso else None}")
         sess["sso"] = sso
+        sess["sso_attempts"] = list(sso_attempts)
         session_cookies = extract_cookies_from_auth_client(client)
         print(
             f"[grok-build-auth] session cookies after signup: "
@@ -2607,12 +2882,19 @@ def _run_registration(
             session_cookies["sso-rw"] = sso
 
         if not sso:
+            # Keep recoverable markers for later manual/auto re-login import.
+            try:
+                sess["sso_recoverable"] = True
+                sess["sso_missing"] = True
+            except Exception:
+                pass
             raise RuntimeError(
                 "SSO_COOKIE_MISSING after create_account. "
                 f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; "
                 f"create_ok={bool(getattr(res, 'ok', False))}; "
                 f"signup_error={signup_err!r}; set_cookies={len(sc)}; "
                 f"cookie_keys={sorted((session_cookies or {}).keys())}; "
+                f"attempts={sso_attempts}; "
                 f"body_preview={rsc_preview!r}. "
                 "Account may have been created, but neither RSC set-cookie chain "
                 "nor CreateSession password fallback produced an sso cookie. "
@@ -2680,6 +2962,10 @@ def _run_registration(
             "email": email,
         }
         # Auto probe newly imported accounts so they are validated in the pool.
+        # Release global admission BEFORE the settle sleep so bulk jobs don't
+        # hold scarce inflight slots for REGISTER_PROBE_DELAY_SEC after success.
+        if admission_flag is not None:
+            _release_reg_admission_once(admission_flag)
         probe_summaries: list[dict[str, Any]] = []
         if imported_ids:
             delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
@@ -2692,7 +2978,25 @@ def _run_registration(
                     imported_accounts=imported_accounts,
                     probe_delay_sec=delay,
                 )
-                time.sleep(delay)
+                # Heartbeat during settle wait so multi-worker reclaim does not
+                # treat a healthy post-import session as an orphan.
+                deadline = time.time() + delay
+                while True:
+                    remaining_wait = deadline - time.time()
+                    if remaining_wait <= 0:
+                        break
+                    time.sleep(min(10.0, remaining_wait))
+                    left = max(0.0, deadline - time.time())
+                    if left <= 0:
+                        break
+                    update(
+                        "probing",
+                        f"imported {len(imported_ids)} account(s); wait "
+                        f"{int(left)}s before probe [{ADAPTER_BUILD}]",
+                        imported_account_ids=imported_ids,
+                        imported_accounts=imported_accounts,
+                        probe_delay_sec=delay,
+                    )
             update(
                 "probing",
                 f"imported {len(imported_ids)} account(s); probing pool health "
@@ -2880,6 +3184,45 @@ def reclaim_orphaned_registration_sessions(
         with _lock:
             sessions = [dict(v) for v in _sessions.values() if isinstance(v, dict)]
 
+    # Cache batch liveness so multi-worker reclaim does not thrash Redis.
+    batch_live: dict[str, dict[str, Any]] = {}
+
+    def _batch_liveness(bid0: str) -> dict[str, Any]:
+        if bid0 in batch_live:
+            return batch_live[bid0]
+        info = {
+            "has_runner": False,
+            "batch_age": 1e18,
+            "batch_status": "",
+            "runner_alive_flag": False,
+        }
+        if not bid0:
+            batch_live[bid0] = info
+            return info
+        with _lock:
+            info["has_runner"] = bool(_active_batch_runners.get(bid0))
+        b = _load_reg_batch(bid0) or {}
+        if isinstance(b, dict) and b:
+            info["batch_status"] = str(b.get("status") or "").strip().lower()
+            info["runner_alive_flag"] = bool(b.get("runner_alive"))
+            info["batch_age"] = now - float(
+                b.get("updated_at") or b.get("created_at") or 0
+            )
+        if not info["has_runner"] and _reg_redis():
+            try:
+                from store.redis_client import get_str as redis_get
+
+                if redis_get(_batch_runner_lock_key(bid0)):
+                    info["has_runner"] = True
+            except Exception:
+                pass
+        # IMPORTANT: do NOT treat runner_alive/updated_at alone as live.
+        # Multi-worker reclaim/TTL paths used to refresh updated_at and leave
+        # runner_alive=true after the real runner died, which permanently
+        # blocked auto-resume and stranded sessions in solving_turnstile.
+        batch_live[bid0] = info
+        return info
+
     for sess in sessions:
         sid = str(sess.get("id") or "").strip()
         if not sid:
@@ -2890,24 +3233,57 @@ def reclaim_orphaned_registration_sessions(
         st = str(sess.get("status") or "").strip().lower()
         if st in _TERMINAL_STATUSES or st not in nonterm:
             continue
-        # Always reclaim if no local/remote runner can own it; use stale age as
-        # a safety so we don't kill a still-running worker in the same process.
         age = now - float(sess.get("updated_at") or sess.get("created_at") or 0)
-        # If this process holds an active runner for the batch, only reclaim
-        # sessions older than ttl (true stalls). If no runner, reclaim all
-        # non-terminal after a short grace (30s) so resume can proceed.
-        has_runner = False
-        if bid:
-            with _lock:
-                has_runner = bool(_active_batch_runners.get(bid))
-            if not has_runner and _reg_redis():
-                try:
-                    from store.redis_client import get_str as redis_get
-
-                    has_runner = bool(redis_get(_batch_runner_lock_key(bid)))
-                except Exception:
-                    has_runner = False
-        min_age = ttl if has_runner else min(30.0, ttl)
+        live = _batch_liveness(bid) if bid else {
+            "has_runner": False,
+            "batch_age": 1e18,
+            "batch_status": "",
+            "runner_alive_flag": False,
+        }
+        has_runner = bool(live.get("has_runner"))
+        batch_age = float(live.get("batch_age") or 1e18)
+        # Live batch: only reclaim truly stalled sessions.
+        # Local Turnstile is process-global serialized — under bulk load
+        # (600+ / concurrency 3-5) healthy sessions routinely wait several
+        # minutes for the lock. Keep a long grace for captcha/device stages.
+        long_wait_statuses = {
+            "solving_turnstile",
+            "waiting_email",
+            "converting",
+            "probing",
+            "creating_account",
+            "registering",
+        }
+        try:
+            captcha_grace = float(
+                os.environ.get("GROK2API_REG_CAPTCHA_STALE_SEC", "900") or 900
+            )
+        except (TypeError, ValueError):
+            captcha_grace = 900.0
+        captcha_grace = max(300.0, min(3600.0, captcha_grace))
+        if has_runner:
+            if st in long_wait_statuses:
+                min_age = max(ttl, captcha_grace)
+            else:
+                min_age = max(ttl, 180.0)
+        elif batch_age < max(ttl, 90.0) and str(live.get("batch_status") or "") in {
+            "running",
+            "starting",
+            "stopping",
+            "partial",
+        }:
+            # Batch metadata is still being touched (another worker owns runner).
+            if st in long_wait_statuses:
+                min_age = max(ttl, captcha_grace)
+            else:
+                min_age = max(ttl, 180.0)
+        else:
+            # Dead batch: free slots sooner, but still give captcha a longer
+            # window so a brief runner restart does not mass-fail the queue.
+            if st in long_wait_statuses:
+                min_age = min(max(120.0, captcha_grace / 2.0), captcha_grace)
+            else:
+                min_age = min(max(45.0, ttl / 2.0), ttl)
         if age < min_age:
             continue
         msg = (
@@ -2918,22 +3294,35 @@ def reclaim_orphaned_registration_sessions(
             cur = _sessions.get(sid) or dict(sess)
             prev = str(cur.get("status") or "").strip().lower()
             already_terminal = prev in _TERMINAL_STATUSES
+            # Another worker may have finished this session since we listed it.
+            if already_terminal or prev in _TERMINAL_STATUSES:
+                continue
+            # Fresh update since list snapshot → still alive; skip.
+            cur_age = now - float(cur.get("updated_at") or cur.get("created_at") or 0)
+            if cur_age < min_age:
+                continue
             cur["status"] = "error"
             cur["error"] = msg
             cur["message"] = msg
-            cur["cancel_requested"] = False
+            # Ask any still-alive worker to exit; do NOT bump batch finished here.
+            # Bumping finished permanently consumes bulk slots that should be
+            # retried after a dead runner, and can double-count when a live
+            # worker later returns and _note_result() increments again.
+            cur["cancel_requested"] = True if has_runner else False
             cur["updated_at"] = now
             _sessions[sid] = cur
             _mirror_reg_sess(sid, dict(cur))
-            # Count orphan as failed completion so batch remaining does not overshoot.
-            if bid and not already_terminal:
+            if bid:
                 b = _batches.get(bid) or _load_reg_batch(bid) or {"id": bid}
                 b = dict(b)
-                b["fail_count"] = int(b.get("fail_count") or 0) + 1
-                b["finished"] = int(b.get("finished") or 0) + 1
-                b["updated_at"] = now
+                # Do NOT bump batch updated_at here — that falsely signals a live
+                # runner to multi-worker reclaim/resume and blocks auto-heal.
                 if not b.get("message"):
                     b["message"] = "reclaimed orphan sessions"
+                # No local/remote lock ⇒ runner is dead; clear sticky flag.
+                if not has_runner:
+                    b["runner_alive"] = False
+                    b["inflight"] = 0
                 _batches[bid] = b
                 _mirror_reg_batch(bid, dict(b))
         reclaimed.append(
@@ -2943,6 +3332,8 @@ def reclaim_orphaned_registration_sessions(
                 "prev_status": st,
                 "age_sec": int(age),
                 "email": sess.get("email"),
+                "already_terminal": already_terminal,
+                "had_runner": has_runner,
             }
         )
     return {
@@ -3093,6 +3484,7 @@ def resume_registration_batch(
         _batches[bid] = b
         _mirror_reg_batch(bid, dict(b))
 
+    _ensure_registration_watchdog()
     spawned = _spawn_batch_runner(
         bid,
         remaining=remaining,
@@ -3164,6 +3556,7 @@ def reclaim_orphaned_registration_batches(
 
     resumed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    now_ts = _now()
     # Newest first.
     batches = sorted(
         batches, key=lambda b: float(b.get("updated_at") or b.get("created_at") or 0), reverse=True
@@ -3191,26 +3584,44 @@ def reclaim_orphaned_registration_batches(
         if has_local:
             skipped.append({"batch_id": bid, "reason": "local_runner_alive", "status": st})
             continue
+        # Multi-worker: another process may own the runner. Never force-clear a
+        # live lock / recently-updated running batch — that causes thrash and
+        # orphan reclaim of healthy in-flight sessions.
+        batch_age = now_ts - float(b.get("updated_at") or b.get("created_at") or 0)
+        lock_token = None
         if _reg_redis():
             try:
                 from store.redis_client import get_str as redis_get
 
-                token = redis_get(_batch_runner_lock_key(bid))
-                if token:
-                    # Stale lock from previous process — clear so resume can claim.
-                    try:
-                        from store.redis_client import compare_and_delete
-
-                        compare_and_delete(_batch_runner_lock_key(bid), str(token))
-                    except Exception:
-                        try:
-                            from store.redis_client import set_ex
-
-                            set_ex(_batch_runner_lock_key(bid), "reclaimed", 1)
-                        except Exception:
-                            pass
+                lock_token = redis_get(_batch_runner_lock_key(bid))
             except Exception:
-                pass
+                lock_token = None
+        if lock_token:
+            # Live lock means another process still owns the runner.
+            skipped.append(
+                {
+                    "batch_id": bid,
+                    "reason": "remote_runner_lock_live",
+                    "status": st,
+                    "batch_age": int(batch_age),
+                }
+            )
+            continue
+        # No lock + no local runner = dead runner. Clear sticky runner_alive
+        # even if updated_at is recent (reclaim/TTL used to refresh it).
+        if bool(b.get("runner_alive")) or int(b.get("inflight") or 0) > 0:
+            with _lock:
+                cur = _batches.get(bid) or dict(b)
+                cur = dict(cur)
+                cur["runner_alive"] = False
+                cur["inflight"] = 0
+                # Keep updated_at unchanged so we don't create a false heartbeat.
+                cur["message"] = (
+                    "cleared sticky runner_alive (no runner lock)"
+                )
+                _batches[bid] = cur
+                _mirror_reg_batch(bid, dict(cur))
+            b = cur
         count = int(b.get("count") or 0)
         finished = int(b.get("finished") or 0)
         if count > 0 and finished >= count:
@@ -3230,6 +3641,126 @@ def reclaim_orphaned_registration_batches(
         "resumed": resumed,
         "skipped": skipped[:20],
     }
+
+
+def _refresh_active_registration_ttls() -> int:
+    """Refresh Redis TTLs for active batches without faking liveness timestamps.
+
+    Important: multi-worker reclaim/resume uses `updated_at` + `runner_alive` to
+    decide whether a batch is still owned. Rewriting those fields here would
+    keep a dead batch forever "alive" and prevent auto-resume.
+    """
+    if not _reg_redis():
+        return 0
+    refreshed = 0
+    try:
+        from store import sessions_redis
+    except Exception:
+        return 0
+    try:
+        batches = sessions_redis.reg_batch_list() or []
+    except Exception:
+        batches = []
+    if not isinstance(batches, list):
+        return 0
+    for b in batches:
+        if not isinstance(b, dict):
+            continue
+        bid = str(b.get("id") or "").strip()
+        if not bid:
+            continue
+        st = str(b.get("status") or "").strip().lower()
+        count = int(b.get("count") or 0)
+        finished = int(b.get("finished") or 0)
+        active = st in {"running", "starting", "stopping", "partial"} or (
+            count > 0 and finished < count and st not in {"cancelled", "stopped", "done"}
+        )
+        if not active:
+            continue
+        try:
+            if sessions_redis.reg_batch_touch(bid):
+                refreshed += 1
+        except Exception:
+            pass
+        # Refresh non-terminal session TTLs only (no payload rewrite). Cap per tick.
+        try:
+            listed = sessions_redis.reg_sess_list() or []
+        except Exception:
+            listed = []
+        touched = 0
+        for sess in listed:
+            if not isinstance(sess, dict):
+                continue
+            if str(sess.get("batch_id") or "").strip() != bid:
+                continue
+            st_s = str(sess.get("status") or "").strip().lower()
+            if st_s in _TERMINAL_STATUSES:
+                continue
+            sid_s = str(sess.get("id") or "").strip()
+            if not sid_s:
+                continue
+            try:
+                sessions_redis.reg_sess_touch(sid_s)
+                touched += 1
+            except Exception:
+                pass
+            if touched >= 200:
+                break
+        if touched == 0:
+            for sid in list(b.get("session_ids") or [])[-200:]:
+                sid_s = str(sid or "").strip()
+                if not sid_s:
+                    continue
+                try:
+                    sessions_redis.reg_sess_touch(sid_s)
+                except Exception:
+                    pass
+    return refreshed
+
+
+def _ensure_registration_watchdog() -> None:
+    """Start a process-local daemon that self-heals unfinished bulk batches."""
+    global _reg_watchdog_started
+    with _reg_watchdog_lock:
+        if _reg_watchdog_started:
+            return
+        _reg_watchdog_started = True
+
+    def _loop() -> None:
+        # Stagger first pass so app startup reclaim finishes first.
+        time.sleep(min(20.0, max(5.0, REG_WATCHDOG_SEC / 2.0)))
+        while True:
+            try:
+                refreshed = _refresh_active_registration_ttls()
+                # Only resume batches that still have remaining work and no local runner.
+                try:
+                    max_batches = int(
+                        os.environ.get("GROK2API_REG_WATCHDOG_RESUME_MAX", "3") or 3
+                    )
+                except (TypeError, ValueError):
+                    max_batches = 3
+                result = reclaim_orphaned_registration_batches(
+                    auto_resume=True,
+                    max_batches=max(0, min(10, max_batches)),
+                    stale_sec=REG_WATCHDOG_STALE_SEC,
+                )
+                resumed_n = int(result.get("batches_resumed") or 0)
+                reclaimed_n = int(result.get("sessions_reclaimed") or 0)
+                if refreshed or resumed_n or reclaimed_n:
+                    print(
+                        f"[registration] watchdog tick: "
+                        f"ttl_refresh={refreshed} reclaimed={reclaimed_n} "
+                        f"resumed={resumed_n}"
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"[registration] watchdog error: {e}")
+            time.sleep(REG_WATCHDOG_SEC)
+
+    threading.Thread(
+        target=_loop,
+        daemon=True,
+        name="gba-reg-watchdog",
+    ).start()
 
 
 def stop_registration_session(session_id: str) -> dict[str, Any]:

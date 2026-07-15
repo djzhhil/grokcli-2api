@@ -582,6 +582,11 @@ def _merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
     Explicit later empty string (Edit/Update new_string="") must overwrite an
     earlier non-empty value when the model rewrites the full object; missing
     keys still do not wipe earlier content.
+
+    Raw aliases are preserved during the merge so that
+    ``normalize_tool_argument_keys`` can prefer an already-canonical key
+    (``file_path``) over a conflicting alias (``path``) after the fact —
+    critical for Claude Code → sub2api → grokcli-2api Update/Edit streams.
     """
     dicts = [v for v in values if isinstance(v, dict)]
     if not dicts:
@@ -611,7 +616,8 @@ def _merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
                 # Prefer later value when both set (correction / expansion).
                 if v not in (None, "", [], {}):
                     merged[k] = v
-    return merged
+    # Apply key alias preference once at the end (canonical beats alias).
+    return normalize_tool_argument_keys(merged)
 
 
 def sanitize_tool_arguments_json(raw: Any) -> str:
@@ -948,25 +954,56 @@ def _canonical_tool_arg_key(key: str) -> str:
     return raw
 
 
+def _tool_arg_value_empty(value: Any) -> bool:
+    return value in (None, "", [], {})
+
+
 def normalize_tool_argument_keys(obj: Any) -> Any:
     """Rename common alternate tool-arg keys to Claude Code schema names.
 
     Does not invent values — only remaps keys like path→file_path,
-    oldString→old_string. Existing canonical keys win over aliases.
+    oldString→old_string.
+
+    Preference when several keys collapse to the same canonical name:
+    1. Non-empty value from an **already-canonical** key wins over aliases
+       (``file_path`` beats ``path`` / ``filepath`` / ``file``).
+    2. Non-empty beats empty.
+    3. Otherwise keep the first non-empty (stable).
+
+    Claude Code → sub2api → grokcli-2api often sees both ``path`` (OpenAI /
+    Cursor style) and ``file_path`` (Claude Code Edit/Update schema) in one
+    object after stream merge. First-alias-wins used to make Update/Edit open
+    the wrong file when ``path`` happened to appear before ``file_path``.
     """
     if not isinstance(obj, dict):
         return obj
-    out: dict[str, Any] = {}
+    # (value, from_canonical_key)
+    chosen: dict[str, tuple[Any, bool]] = {}
     for k, v in obj.items():
-        canon = _canonical_tool_arg_key(str(k))
-        # Prefer already-canonical / first non-empty value.
-        if canon in out:
-            old = out.get(canon)
-            if old in (None, "", [], {}) and v not in (None, "", [], {}):
-                out[canon] = v
+        raw = str(k)
+        canon = _canonical_tool_arg_key(raw)
+        from_canon = raw == canon
+        if canon not in chosen:
+            chosen[canon] = (v, from_canon)
             continue
-        out[canon] = v
-    return out
+        old_v, old_canon = chosen[canon]
+        old_empty = _tool_arg_value_empty(old_v)
+        new_empty = _tool_arg_value_empty(v)
+        if old_empty and not new_empty:
+            chosen[canon] = (v, from_canon)
+            continue
+        if new_empty:
+            # Keep prior (possibly empty) unless the new key is canonical and
+            # the prior came from an alias — still prefer non-empty above.
+            continue
+        # Both non-empty: exact canonical key beats alias (path vs file_path).
+        if from_canon and not old_canon:
+            chosen[canon] = (v, True)
+            continue
+        if old_canon and not from_canon:
+            continue
+        # Same class (both alias or both canonical) — keep first non-empty.
+    return {k: v for k, (v, _) in chosen.items()}
 
 
 def normalize_tool_arguments_json(
@@ -1507,28 +1544,36 @@ def merge_tool_argument_delta(
     For object rewrites with different key sets (Update: first only file_path,
     later file_path+old_string+new_string), prefer the richer later object and
     deep-merge dict keys so partial previews don't win forever.
+
+    Path preference note (Claude Code → sub2api → grokcli-2api):
+    alias-normalize *after* structural merge. If we normalize first, a later
+    ``{"path":"/wrong", ...}`` becomes ``{"file_path":"/wrong", ...}`` and
+    blindly overwrites an earlier correct ``file_path``. Merging raw keys first
+    keeps both ``path`` and ``file_path``, then ``normalize_tool_argument_keys``
+    prefers the already-canonical ``file_path``.
     """
-    # Sanitize doubled blobs first, then alias-normalize keys so readiness checks
-    # see file_path/old_string even when the model sent path/oldString.
+    # Sanitize doubled blobs first. Alias-normalize only for readiness checks
+    # and final return — structural merge uses raw keys so path/file_path can
+    # coexist until preference is applied.
+    cur_raw = sanitize_tool_arguments_json(current) if current else ""
+    piece_raw = sanitize_tool_arguments_json(incoming) if incoming else ""
     cur = (
-        normalize_tool_arguments_json(current, tool_name=tool_name)
-        if current
-        else ""
+        normalize_tool_arguments_json(cur_raw, tool_name=tool_name) if cur_raw else ""
     )
     piece = (
-        normalize_tool_arguments_json(incoming, tool_name=tool_name)
-        if incoming
+        normalize_tool_arguments_json(piece_raw, tool_name=tool_name)
+        if piece_raw
         else ""
     )
-    if not piece:
+    if not piece and not piece_raw:
         return cur
-    if not cur:
-        return piece
-    if piece == cur:
+    if not cur and not cur_raw:
+        return piece or piece_raw
+    if piece and cur and piece == cur:
         return cur
-    if piece.startswith(cur):
+    if piece and cur and piece.startswith(cur):
         return piece
-    if cur.startswith(piece):
+    if cur and piece and cur.startswith(piece):
         return cur
 
     # Prefer object/array completeness for tool args. Intermediate scalars such
@@ -1539,10 +1584,20 @@ def merge_tool_argument_delta(
     piece_any = is_complete_json_text(piece)
 
     # Incomplete → complete rewrite (spacing / key order / full resend).
-    if piece_complete and not cur_complete:
+    # When both sides parse as dicts we still deep-merge below so a complete
+    # later object with only alias path cannot erase an earlier file_path.
+    both_dicts = False
+    try:
+        a0 = json.loads(cur_raw or cur or "null")
+        b0 = json.loads(piece_raw or piece or "null")
+        both_dicts = isinstance(a0, dict) and isinstance(b0, dict)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        both_dicts = False
+
+    if piece_complete and not cur_complete and not both_dicts:
         return piece
     # Complete object/array → refuse trailing junk or second incomplete fragment.
-    if cur_complete and not piece_complete:
+    if cur_complete and not piece_complete and not both_dicts:
         return cur
     # If cur is only a scalar fragment and piece continues the real object,
     # fall through to append / structural merge below.
@@ -1551,13 +1606,18 @@ def merge_tool_argument_delta(
         pass
 
     try:
-        a = json.loads(cur)
-        b = json.loads(piece)
+        # Prefer raw (pre-alias) objects so path and file_path stay distinct
+        # until normalize_tool_argument_keys applies preference.
+        a = json.loads(cur_raw or cur)
+        b = json.loads(piece_raw or piece)
         if a == b:
-            return cur
+            return cur or normalize_tool_arguments_json(
+                cur_raw, tool_name=tool_name
+            )
         if isinstance(a, dict) and isinstance(b, dict):
-            # Field growth / partial rewrite: merge keys.
-            # Example: {"file_path":"x"} + {"file_path":"x","old_string":"a",...}
+            # Field growth / partial rewrite: merge keys on RAW aliases first.
+            # Example: {"file_path":"/correct"} + {"path":"/wrong","old_string":...}
+            # must keep file_path=/correct after normalize, not /wrong.
             # Explicit later empty string is kept (Edit/Update new_string="" delete).
             merged = dict(a)
             for k, v in b.items():
@@ -1576,23 +1636,32 @@ def merge_tool_argument_delta(
                 elif isinstance(old, list) and isinstance(v, list) and len(v) >= len(old):
                     merged[k] = v
                 else:
-                    # Prefer later value when both set (correction / expansion).
+                    # Prefer later value when both set (correction / expansion)
+                    # for the *same raw key*. Cross-alias conflicts are resolved
+                    # by normalize_tool_argument_keys (canonical beats alias).
                     merged[k] = v
             try:
-                return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+                merged_text = json.dumps(
+                    merged, ensure_ascii=False, separators=(",", ":")
+                )
             except (TypeError, ValueError):
-                return piece if len(b) >= len(a) else cur
+                merged_text = piece_raw or piece if len(b) >= len(a) else (cur_raw or cur)
+            return normalize_tool_arguments_json(merged_text, tool_name=tool_name)
         if isinstance(a, list) and isinstance(b, list):
             # Prefer later / longer list.
-            return piece if len(b) >= len(a) else cur
+            chosen = piece_raw or piece if len(b) >= len(a) else (cur_raw or cur)
+            return normalize_tool_arguments_json(chosen, tool_name=tool_name)
         if isinstance(a, (dict, list)) and not isinstance(b, (dict, list)):
-            return cur
+            return cur or normalize_tool_arguments_json(cur_raw, tool_name=tool_name)
         if isinstance(b, (dict, list)) and not isinstance(a, (dict, list)):
-            return piece
+            return piece or normalize_tool_arguments_json(
+                piece_raw, tool_name=tool_name
+            )
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
     # Both incomplete / non-JSON: only append when it looks like a true delta.
-    return cur + piece
+    appended = (cur_raw or cur) + (piece_raw or piece)
+    return normalize_tool_arguments_json(appended, tool_name=tool_name)
 
 
 class AnthropicStreamAssembler:

@@ -2,21 +2,21 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.79** · 注册机自愈恢复 · 全局并发保护 · 导出 SSO · Update→Edit
+**当前版本：v1.9.80** · Update 路径纠偏 · 注册日志秒级刷新 · 大批量注册 Watchdog
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.79` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.80` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
 - **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）
-- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` 自动映射为 Claude Code `Edit`
+- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` → `Edit`，且 **`file_path` 优先于 `path`**（避免读错文件）
 - **大账号池**：Token 自动续期、模型健康探测、冷却状态落库
 - **会话粘性**：`prompt_cache_key` / `previous_response_id` 固定同一账号，利于多轮缓存
 - **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms`；任务日志 + 终态帧
@@ -49,8 +49,8 @@
 |------|------|
 | OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
-| Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；参数别名归一化；残缺编辑不下发 |
-| 注册机 | 批次自愈恢复 + 孤儿会话回收；全局 inflight 限流；Device Flow 重试；**导出 SSO** |
+| Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**`file_path` 优先于 `path` 别名**；流式合并不读错文件；残缺编辑不下发 |
+| 注册机 | 批次自愈恢复 + 孤儿会话回收；全局 inflight 限流；Device Flow 重试；**导出 SSO**；进度日志秒级刷新 |
 | 管理台 | 账号、Key、协议注册、测活、续期、**任务日志**、用量、设置 |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；可选**出站代理池**（聊天/测活/续期） |
 | 会话粘性 | `prompt_cache_key`（body/header）与 Responses `previous_response_id` 粘同一账号；未传时自动 mint 并回传 |
@@ -102,6 +102,10 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 | `GROK2API_CAPTCHA_PROVIDER` | `local` | `local`（容器内联）/ `yescaptcha` |
 | `GROK2API_INLINE_SOLVER` | `1` | `1` 时入口脚本在主容器内启动过盾 |
 | `GROK2API_REG_CONCURRENCY` | `3` | 协议注册默认并发 |
+| `GROK2API_REG_GLOBAL_INFLIGHT` | `6` | 跨批次全局同时注册上限 |
+| `GROK2API_REG_TTL_SEC` | `259200`（72h） | 注册批次/会话 Redis TTL（大批量可调高） |
+| `GROK2API_REG_WATCHDOG_SEC` | `45` | 运行中自愈扫描间隔 |
+| `GROK2API_SSO_DEVICE_RETRIES` | `6` | device-flow 限流重试次数 |
 | `TURNSTILE_THREAD` | `= REG_CONCURRENCY` | 本地过盾浏览器线程数 |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型 |
 | `TURNSTILE_PORT` | `5072` | 内联过盾监听端口（容器内 loopback） |
@@ -142,7 +146,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.79
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.80
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -181,7 +185,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.79
+    image: ghcr.io/hm2899/grokcli-2api:1.9.80
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -405,16 +409,16 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.79"
+git add -A && git commit -m "release: v1.9.80"
 git push origin main
-git tag -a v1.9.79 -m "v1.9.79"
-git push origin v1.9.79
-gh release create v1.9.79 --title "v1.9.79 注册机自愈恢复 · 全局并发保护" --notes-file - <<'EOF'
+git tag -a v1.9.80 -m "v1.9.80"
+git push origin v1.9.80
+gh release create v1.9.80 --title "v1.9.80 Update 路径纠偏 · 注册日志秒级刷新 · Watchdog" --notes-file - <<'EOF'
 ## Highlights
-- 注册批次进程重启后自动回收孤儿会话并 resume
-- 跨批次全局 inflight 限流 + 本地过盾 soft-pause
-- resume / reclaim API
-- 继承导出 SSO、device-flow 限流重试
+- Claude Code → sub2api → grokcli-2api：Update/Edit `file_path` 优先于 `path`，流式合并不再读错文件
+- 注册进度日志秒级刷新：多 worker 按 Redis `updated_at` 取最新；前端 trailing-edge 轮询
+- 等邮件阶段心跳文案；注册批次/会话 Redis TTL 默认 72h + 运行中 Watchdog
+- MoeMail 创建 503/429 重试；device-flow 限流重试更强
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -423,7 +427,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.79
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.80
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -467,7 +471,20 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.79**（当前）
+- **v1.9.80**（当前）
+  - **Update 读文件纠偏（Claude Code → sub2api）**：`file_path` 规范键优先于 `path`/`filepath`/`file` 别名；流式 merge 先保留原始 key 再归一，避免打开错误路径
+  - OpenAI Responses / Anthropic 出口同步；`Update`/`StrReplace` 仍 remap 为 `Edit`
+  - **注册进度日志秒级刷新**：多 worker 按 Redis `updated_at` 合并最新 session/batch；前端 trailing-edge 轮询（~1s）+ 并行拉取，batch 已带 sessions 时跳过全量 list
+  - 等邮件阶段 `on_tick` 心跳（`waiting · Ns elapsed`），日志不再长时间静默
+  - **大批量注册稳定（600+ 必现）**：本地过盾串行排队时心跳续期，避免 `solving_turnstile` 被 orphan reclaim 误杀
+  - 过盾/等邮件/device-flow 状态独立 stale 阈值（`GROK2API_REG_CAPTCHA_STALE_SEC` 默认 900s）
+  - 注册批次/会话 Redis TTL 默认 **72h**（`GROK2API_REG_TTL_SEC`），运行中仅 touch TTL，不伪造 `runner_alive`
+  - **运行中 Watchdog**：不依赖进程重启，定期 reclaim 真死会话并 auto-resume 无 runner 批次
+  - MoeMail 创建邮箱对 429/5xx 自动重试；device-flow 默认重试 6 次、退避上限 45s
+  - 导入后 probe 等待心跳 + 提前释放全局 inflight
+  - 孤儿 reclaim 不再错误地提前消耗 `finished` 配额（避免 resume 少跑）
+  - 继承 v1.9.79：启动自愈、全局 inflight、resume/reclaim API
+- **v1.9.79**
   - **注册机自愈**：进程重启/发版后自动回收卡在 `solving_turnstile` 等状态的孤儿会话，并 resume 未完成批次
   - **全局并发保护**：`GROK2API_REG_GLOBAL_INFLIGHT` 限制跨批次同时注册数，避免多批×多线程冲垮本地过盾
   - 本地 captcha resume 并发默认 3；过盾超时 / device-flow 失败时 soft-pause
@@ -577,7 +594,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.79**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.80**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

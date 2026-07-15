@@ -25,6 +25,7 @@ window.G2A = window.G2A || {};
   let regFinishedNotified = false;
   let regStopping = false;
   let regPollInFlight = false;
+  let regPollPending = false;
   let regLastLogText = "";
   let regLastStatusText = "";
   let regLastEmailText = "";
@@ -696,7 +697,7 @@ on("btn-export-sso", "onclick", () => exportRegistrationSso());
       toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-      startRegPolling({ immediate: true, intervalMs: 2000 });
+      startRegPolling({ immediate: true, intervalMs: 1000 });
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
@@ -2409,7 +2410,10 @@ function dismissRegProgressCard() {
 
 function stopRegPolling() {
   try { clearInterval(regPollTimer); } catch (_) {}
+  try { clearTimeout(regPollTimer); } catch (_) {}
   regPollTimer = null;
+  regPollInFlight = false;
+  regPollPending = false;
 }
 
 function isNotFoundError(err) {
@@ -2442,14 +2446,19 @@ function markTrackedRegistrationMissing(reason) {
   clearRegTrack();
 }
 
-function startRegPolling({ immediate = true, intervalMs = 2000 } = {}) {
+function startRegPolling({ immediate = true, intervalMs = 1000 } = {}) {
   try { clearInterval(regPollTimer); } catch (_) {}
-  // While stopping, poll a bit slower to reduce UI thrash; never sub-second.
-  const ms = Math.max(regStopping ? 2000 : 1000, Number(intervalMs) || 2000);
+  try { clearTimeout(regPollTimer); } catch (_) {}
+  // Active registration needs ~1s freshness so waiting_email / captcha lines
+  // do not sit stale. Stopping uses a gentler cadence.
+  const ms = Math.max(regStopping ? 1500 : 800, Number(intervalMs) || 1000);
   regPollTimer = setInterval(() => {
     pollRegSession().catch(() => {});
   }, ms);
-  if (immediate) setTimeout(() => { pollRegSession().catch(() => {}); }, 300);
+  // Immediate first poll — do not wait a full interval (or the old 300ms delay).
+  if (immediate) {
+    setTimeout(() => { pollRegSession().catch(() => {}); }, 0);
+  }
 }
 
 async function stopRegistration() {
@@ -2560,7 +2569,7 @@ async function stopRegistration() {
     showPanel("reg-session-box");
     saveRegTrack();
     // Keep polling until cancelled/stopped, but avoid aggressive 1.2s thrash.
-    startRegPolling({ immediate: true, intervalMs: 2000 });
+    startRegPolling({ immediate: true, intervalMs: 1000 });
   } catch (e) {
     regStopping = false;
     toast((e && e.message) || "停止失败", false);
@@ -3258,12 +3267,12 @@ function adoptRegSessions(sessions, { batch = null, continuePolling = true } = {
   const finished = !!batchDone || (allTerminal && !batchRunning);
 
   if (continuePolling && !finished) {
-    startRegPolling({ immediate: true, intervalMs: 2000 });
+    startRegPolling({ immediate: true, intervalMs: 1000 });
   } else if (finished) {
     // One more poll paints the final summary / stops the timer cleanly.
     pollRegSession().catch(() => {});
   } else {
-    startRegPolling({ immediate: true, intervalMs: 2000 });
+    startRegPolling({ immediate: true, intervalMs: 1000 });
   }
   saveRegTrack();
   return true;
@@ -3731,11 +3740,18 @@ async function probeImportedAccounts(accountIds, { sessions = [], delaySec = 30 
 }
 
 async function pollRegSession() {
-  // Prevent overlapping polls (stop + interval + soft-nav rebind) from thrashing DOM.
-  if (regPollInFlight) return;
+  // Trailing-edge: never silently drop a tick while a previous poll is still
+  // in flight — that freezes the progress log until the next free interval.
+  if (regPollInFlight) {
+    regPollPending = true;
+    return;
+  }
   regPollInFlight = true;
+  regPollPending = false;
   try {
   // Prefer batch endpoint when available for accurate total/success/fail.
+  // Batch embeds compact sessions (status/message/updated_at), so one request
+  // is enough for timely log updates in the common path.
   let batch = null;
   let batchMissing = false;
   if (regBatchId) {
@@ -3767,12 +3783,23 @@ async function pollRegSession() {
       sessions = batch.sessions.slice();
       sessionHits = sessions.length;
     } else {
-      for (const id of ids) {
-        try {
-          sessions.push(await api("/accounts/register-email/sessions/" + encodeURIComponent(id)));
+      // Parallel fetches: serial awaits on N sessions made each tick multi-second
+      // and caused the log panel to lag far behind real progress.
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            return { ok: true, data: await api("/accounts/register-email/sessions/" + encodeURIComponent(id)) };
+          } catch (e) {
+            return { ok: false, missing: isNotFoundError(e) };
+          }
+        })
+      );
+      for (const r of results) {
+        if (r && r.ok && r.data) {
+          sessions.push(r.data);
           sessionHits += 1;
-        } catch (e) {
-          if (isNotFoundError(e)) sessionMisses += 1;
+        } else if (r && r.missing) {
+          sessionMisses += 1;
         }
       }
     }
@@ -3780,8 +3807,15 @@ async function pollRegSession() {
     // Pull all sessions so late-spawned batch workers appear.
     // Strict filter: only the currently tracked batch / session ids — never
     // absorb leftover sessions from a previous finished/stopped registration.
+    // Skip this extra list call when the batch payload already has sessions —
+    // it was the main source of 2–4s poll lag under multi-worker load.
     let listHasTrackedBatch = false;
-    try {
+    const needListSweep =
+      !batch ||
+      !Array.isArray(batch.sessions) ||
+      !batch.sessions.length ||
+      (Array.isArray(batch.session_ids) && batch.sessions.length < batch.session_ids.length);
+    if (needListSweep) try {
       const all = await api("/accounts/register-email/sessions");
       if (all && Array.isArray(all.sessions)) {
         const trackedIds = new Set(
@@ -3804,9 +3838,14 @@ async function pollRegSession() {
             known.add(id);
             sessionHits += 1;
           } else {
-            // refresh existing
+            // Prefer the fresher message/status by updated_at when merging.
             const idx = sessions.findIndex((x) => regSessionKey(x) === id);
-            if (idx >= 0) sessions[idx] = s;
+            if (idx >= 0) {
+              const cur = sessions[idx] || {};
+              const curTs = Number(cur.updated_at || 0) || 0;
+              const nextTs = Number(s.updated_at || 0) || 0;
+              if (nextTs >= curTs) sessions[idx] = s;
+            }
           }
         }
         // Prefer batch stats from list endpoint when present.
@@ -3976,6 +4015,11 @@ async function pollRegSession() {
   } catch (_) {}
   } finally {
     regPollInFlight = false;
+    // Drain trailing-edge request so a tick that arrived mid-flight still runs.
+    if (regPollPending && (regBatchId || regSessionId || (regSessionIds && regSessionIds.length))) {
+      regPollPending = false;
+      setTimeout(() => { pollRegSession().catch(() => {}); }, 50);
+    }
   }
 }
 
@@ -5511,7 +5555,7 @@ if ($("btn-start-reg")) {
         }
         saveRegTrack();
         setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
-        startRegPolling({ immediate: true, intervalMs: 2000 });
+        startRegPolling({ immediate: true, intervalMs: 1000 });
         if (r.batch_id) {
           setTimeout(async () => {
             try {

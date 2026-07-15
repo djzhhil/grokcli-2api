@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from store.redis_client import (
@@ -14,7 +15,19 @@ from store.redis_client import (
 )
 
 DEVICE_TTL = 15 * 60  # 15 minutes
-REG_TTL = 6 * 3600  # 6 hours
+# Bulk registration (thousands of accounts) can run well beyond a few hours.
+# Keep durable batch/session metadata long enough that a paused/resumed
+# 5k job does not silently lose progress mid-flight.
+try:
+    REG_TTL = max(
+        6 * 3600,
+        min(
+            14 * 86400,
+            int(os.environ.get("GROK2API_REG_TTL_SEC", str(72 * 3600)) or (72 * 3600)),
+        ),
+    )
+except (TypeError, ValueError):
+    REG_TTL = 72 * 3600  # 72 hours
 ADMIN_TTL = 7 * 86400  # 7 days
 
 
@@ -106,6 +119,15 @@ def reg_sess_put(session_id: str, sess: dict[str, Any], *, ttl: int = REG_TTL) -
         set_json(_reg_sess_key(session_id), safe, ttl)
 
 
+def reg_sess_touch(session_id: str, *, ttl: int = REG_TTL) -> bool:
+    """Refresh Redis TTL only — do not mutate session payload/timestamps."""
+    if not redis_enabled():
+        return False
+    from store.redis_client import expire
+
+    return bool(expire(_reg_sess_key(session_id), ttl))
+
+
 def reg_sess_get(session_id: str) -> dict[str, Any] | None:
     if not redis_enabled():
         return None
@@ -137,6 +159,15 @@ def reg_batch_put(batch_id: str, batch: dict[str, Any], *, ttl: int = REG_TTL) -
     if not redis_enabled():
         return
     set_json(_reg_batch_key(batch_id), batch, ttl)
+
+
+def reg_batch_touch(batch_id: str, *, ttl: int = REG_TTL) -> bool:
+    """Refresh Redis TTL only — do not mutate batch payload/timestamps."""
+    if not redis_enabled():
+        return False
+    from store.redis_client import expire
+
+    return bool(expire(_reg_batch_key(batch_id), ttl))
 
 
 def reg_batch_get(batch_id: str) -> dict[str, Any] | None:

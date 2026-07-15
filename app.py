@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.79"
+APP_VERSION = "1.9.80"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -594,6 +594,11 @@ def _on_startup() -> None:
                             f"sessions={rr.get('sessions_reclaimed') or 0} "
                             f"batches_resumed={rr.get('batches_resumed') or 0}"
                         )
+                # Keep a mid-run watchdog even if reclaim found nothing — multi-hour
+                # bulk jobs can lose their runner later without a process restart.
+                ensure_wd = getattr(_reg, "_ensure_registration_watchdog", None)
+                if callable(ensure_wd):
+                    ensure_wd()
             except Exception as e:  # noqa: BLE001
                 print(f"  registration reclaim skipped: {e}")
         else:

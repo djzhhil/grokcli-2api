@@ -293,6 +293,10 @@ def main() -> int:
         assert any("[DONE]" in f for f in fail3)
     print("  incomplete Update empty-path OK")
 
+    print("\n=== Update file_path beats path alias ===")
+    test_update_file_path_beats_path_alias()
+    print("  file_path beats path OK")
+
     print("\n=== Update→Edit remapping (Claude Code) ===")
     test_update_to_edit_remap_all_paths()
     print("  Update→Edit remapping OK")
@@ -309,6 +313,71 @@ def main() -> int:
     return 0
 
 
+
+
+
+def test_update_file_path_beats_path_alias():
+    """Claude Code → sub2api → grokcli-2api: Update/Edit must not open the wrong file.
+
+    Stream merges and doubled JSON often carry both path (OpenAI/Cursor style)
+    and file_path (Claude Code schema). Canonical file_path must win.
+    """
+    import json
+    import anthropic_compat as anth
+
+    # 1) Single object: alias first, then canonical
+    n = anth.normalize_tool_argument_keys(
+        {"path": "/wrong", "file_path": "/correct", "old_string": "a", "new_string": "b"}
+    )
+    assert n["file_path"] == "/correct", n
+    assert "path" not in n, n
+
+    # 2) Single object: canonical first, then alias
+    n2 = anth.normalize_tool_argument_keys(
+        {"file_path": "/correct", "path": "/wrong", "old_string": "a", "new_string": "b"}
+    )
+    assert n2["file_path"] == "/correct", n2
+
+    # 3) Stream merge: correct file_path first, later complete rewrite with path alias
+    merged = anth.merge_tool_argument_delta(
+        '{"file_path":"/correct"}',
+        '{"path":"/wrong","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    obj = json.loads(merged)
+    assert obj.get("file_path") == "/correct", merged
+    assert obj.get("old_string") == "a", merged
+    assert obj.get("new_string") == "b", merged
+    assert "path" not in obj, merged
+
+    # 4) Stream merge opposite order: path first, then correct file_path rewrite
+    merged2 = anth.merge_tool_argument_delta(
+        '{"path":"/wrong"}',
+        '{"file_path":"/correct","old_string":"a","new_string":"b"}',
+        tool_name="Update",
+    )
+    obj2 = json.loads(merged2)
+    assert obj2.get("file_path") == "/correct", merged2
+
+    # 5) Doubled blob in one chunk
+    san = anth.sanitize_tool_arguments_json(
+        '{"path":"/wrong"}{"file_path":"/correct","old_string":"a","new_string":"b"}'
+    )
+    san_obj = json.loads(anth.normalize_tool_arguments_json(san, tool_name="Update"))
+    assert san_obj.get("file_path") == "/correct", san_obj
+
+    # 6) Empty canonical should not block a non-empty alias
+    n3 = anth.normalize_tool_argument_keys({"file_path": "", "path": "/only-alias"})
+    assert n3.get("file_path") == "/only-alias", n3
+
+    # 7) openai_responses local mirror agrees
+    import openai_responses as oresp
+    ln = oresp._local_normalize_tool_arg_keys(
+        {"path": "/wrong", "file_path": "/correct"}
+    )
+    assert ln.get("file_path") == "/correct", ln
+
+    print("test_update_file_path_beats_path_alias OK")
 
 
 def test_update_to_edit_remap_all_paths():
@@ -637,3 +706,4 @@ if __name__ == "__main__":
     except Exception as e:
         print("ERROR:", type(e).__name__, e, file=sys.stderr)
         raise
+
