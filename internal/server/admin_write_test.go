@@ -56,3 +56,19 @@ func TestAdminSettingsWriteGated(t *testing.T) {
 		t.Fatalf("settings patch disabled = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestRegistrationFacadeGated(t *testing.T) {
+	rec := httptest.NewRecorder()
+	NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/api/accounts/register-email/availability", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("registration facade disabled = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/accounts/register-email/availability", nil)
+	req.Header.Set("X-Admin-Token", "token")
+	NewMux(Options{Ready: func() bool { return true }, AdminReadEnabled: true, AdminSessions: fakeAdminSessions{ok: true}}).
+		ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("registration without service url = %d body=%s", rec.Code, rec.Body.String())
+	}
+}

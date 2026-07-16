@@ -49,6 +49,7 @@ type Config struct {
 	GoOwnershipMode        string
 	RegistrationMode       string
 	RegistrationServiceURL string
+	RegistrationToken      string
 	StaticDir              string
 	SSEKeepalive           time.Duration
 	RequestTimeout         time.Duration
@@ -156,6 +157,7 @@ func Load() (Config, error) {
 		GoOwnershipMode:        ownershipMode,
 		RegistrationMode:       registrationMode,
 		RegistrationServiceURL: strings.TrimRight(envString("GROK2API_REGISTRATION_SERVICE_URL", ""), "/"),
+		RegistrationToken:      envString("GROK2API_REGISTRATION_TOKEN", ""),
 		StaticDir:              envString("GROK2API_STATIC_DIR", defaultStaticDir),
 		SSEKeepalive:           keepalive,
 		RequestTimeout:         timeout,

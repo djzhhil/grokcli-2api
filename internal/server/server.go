@@ -28,6 +28,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/protocol/anthropic"
 	"github.com/hm2899/grokcli-2api/internal/protocol/responses"
 	"github.com/hm2899/grokcli-2api/internal/proxy"
+	regclient "github.com/hm2899/grokcli-2api/internal/registration/client"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
 )
@@ -47,11 +48,13 @@ type Options struct {
 	Store             *postgres.Connector
 	// Candidates, when non-empty, is used by proxy routes instead of Store.ListPoolCandidates.
 	// Intended for contract/e2e tests against a fake upstream.
-	Candidates    []pool.Candidate
-	AdminSessions admin.SessionVerifier
-	PickObserver  proxy.PickObserver
-	AffinityStore proxy.AffinityStore
-	Config        config.Config
+	Candidates        []pool.Candidate
+	AdminSessions     admin.SessionVerifier
+	PickObserver      proxy.PickObserver
+	AffinityStore     proxy.AffinityStore
+	Config            config.Config
+	RegistrationURL   string
+	RegistrationToken string
 }
 
 // NewMigrationMux exposes migration-safe process probes plus low-risk read-only
@@ -246,6 +249,36 @@ func NewMux(options Options) http.Handler {
 	})
 	mux.HandleFunc("PATCH /admin/api/settings/runtime", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminUpdateSettings(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/register-email/availability", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationAvailability(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/register-email/sessions", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationSessions(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/register-email/sessions/{session_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationSession(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/sessions/{session_id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationStopSession(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/register-email/batches/{batch_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/batches/{batch_id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationStopBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/batches/{batch_id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationResumeBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationStart(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/reclaim", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationReclaim(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/stop", func(w http.ResponseWriter, r *http.Request) {
+		serveRegistrationStopAll(w, r, options)
 	})
 	return mux
 }
@@ -1518,6 +1551,244 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func registrationClient(options Options) *regclient.Client {
+	base := strings.TrimSpace(options.RegistrationURL)
+	if base == "" {
+		base = strings.TrimSpace(options.Config.RegistrationServiceURL)
+	}
+	token := strings.TrimSpace(options.RegistrationToken)
+	if token == "" {
+		token = strings.TrimSpace(options.Config.RegistrationToken)
+	}
+	if base == "" {
+		return nil
+	}
+	return &regclient.Client{BaseURL: base, Token: token}
+}
+
+func requireAdminReadWrite(w http.ResponseWriter, r *http.Request, options Options, write bool) bool {
+	if write {
+		if !adminWriteAllowed(w, r, options) {
+			return false
+		}
+	} else if !adminRouteAllowed(w, r, options) {
+		return false
+	}
+	if _, ok := admin.RequireSession(r, options.AdminSessions); !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "Admin authentication required"})
+		return false
+	}
+	return true
+}
+
+func writeRegistrationError(w http.ResponseWriter, err error) {
+	var re *regclient.Error
+	if errors.As(err, &re) {
+		status := re.Status
+		if status < 400 {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, map[string]any{"detail": re.Detail})
+		return
+	}
+	writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error()})
+}
+
+func serveRegistrationAvailability(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured", "ok": false, "available": false})
+		return
+	}
+	payload, err := client.Availability(r.Context())
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationSessions(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.Sessions(r.Context())
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationSession(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	includeAuth := truthy(r.URL.Query().Get("include_auth_json"))
+	payload, err := client.Session(r.Context(), r.PathValue("session_id"), includeAuth)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationStopSession(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.StopSession(r.Context(), r.PathValue("session_id"))
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.Batch(r.Context(), r.PathValue("batch_id"))
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationStopBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.StopBatch(r.Context(), r.PathValue("batch_id"))
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationResumeBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	force, _ := body["force"].(bool)
+	payload, err := client.ResumeBatch(r.Context(), r.PathValue("batch_id"), force)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idem == "" {
+		idem = strings.TrimSpace(stringValue(body["idempotency_key"]))
+	}
+	payload, err := client.Start(r.Context(), body, idem)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationReclaim(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	autoResume := true
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+		if v, ok := body["auto_resume"].(bool); ok {
+			autoResume = v
+		}
+	}
+	payload, err := client.Reclaim(r.Context(), autoResume)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveRegistrationStopAll(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.StopAll(r.Context())
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func serveAdminUpdateSettings(w http.ResponseWriter, r *http.Request, options Options) {

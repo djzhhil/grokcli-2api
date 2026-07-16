@@ -1,3 +1,5 @@
+> Architecture boundary: [ARCHITECTURE_GO_PYTHON_BOUNDARY.md](./ARCHITECTURE_GO_PYTHON_BOUNDARY.md)
+
 # Anthropic Messages Go canary
 
 This runbook enables the staged Go implementation of:

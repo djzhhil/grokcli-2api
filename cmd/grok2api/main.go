@@ -72,6 +72,8 @@ func main() {
 		PickObserver:      redis.NewPickObserver(redisClient),
 		AffinityStore:     redis.NewChatAffinity(redisClient, cfg.SSEKeepalive*1800),
 		Config:            cfg,
+		RegistrationURL:   cfg.RegistrationServiceURL,
+		RegistrationToken: cfg.RegistrationToken,
 	})
 	httpServer := &http.Server{
 		Addr:              cfg.Address(),

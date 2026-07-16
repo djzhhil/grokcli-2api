@@ -234,6 +234,31 @@
       "maximum": 64,
       "scope": "runtime_behavior",
       "go_behavior": "Anthropic messages max tool_use blocks per turn; 0 = unlimited"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_TOKEN",
+      "type": "string",
+      "default": "",
+      "scope": "registration_boundary",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_REGISTRATION_SIDECAR",
+      "type": "boolean",
+      "default": true,
+      "scope": "registration_boundary"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_HOST",
+      "type": "string",
+      "default": "127.0.0.1",
+      "scope": "registration_boundary"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_PORT",
+      "type": "integer",
+      "default": 18070,
+      "scope": "registration_boundary"
     }
   ]
 }

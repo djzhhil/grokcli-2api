@@ -100,4 +100,25 @@ if [[ "${provider}" == "local" && "${enable_solver}" != "0" ]]; then
 fi
 
 echo "[entrypoint] starting app (${runtime}): ${APP_CMD[*]}"
+
+# When the main runtime is Go, keep Python only for registration/captcha/SSO.
+# The registration sidecar is loopback-only and implements /internal/registration/v1.
+if [[ "${runtime}" == "go" && "${GROK2API_REGISTRATION_SIDECAR:-1}" != "0" ]]; then
+  reg_host="${GROK2API_REGISTRATION_HOST:-127.0.0.1}"
+  reg_port="${GROK2API_REGISTRATION_PORT:-18070}"
+  export GROK2API_REGISTRATION_SERVICE_URL="${GROK2API_REGISTRATION_SERVICE_URL:-http://${reg_host}:${reg_port}}"
+  if [[ -f /app/scripts/registration_service.py ]]; then
+    echo "[entrypoint] starting Python registration sidecar on ${reg_host}:${reg_port}"
+    (
+      cd /app
+      exec python scripts/registration_service.py
+    ) > /app/turnstile-solver/logs/registration_sidecar.log 2>&1 &
+    reg_pid=$!
+    echo "${reg_pid}" > /app/turnstile-solver/logs/registration_sidecar.pid
+    echo "[entrypoint] registration sidecar pid=${reg_pid} url=${GROK2API_REGISTRATION_SERVICE_URL}"
+  else
+    echo "[entrypoint] WARN: scripts/registration_service.py missing; registration admin facade will be unavailable" >&2
+  fi
+fi
+
 exec "${APP_CMD[@]}"
