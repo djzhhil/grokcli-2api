@@ -144,6 +144,72 @@ def normalize_gptmail_base_url(base_url: str | None = None) -> str:
     return origin or GPTMAIL_DEFAULT_BASE_URL
 
 
+
+def parse_domain_list(text: str | None) -> list[str]:
+    """Split multi-domain config into unique hostnames.
+
+    Accepts newlines / commas / semicolons / spaces. Strips ``@`` and leading dots.
+    """
+    if text is None:
+        return []
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    parts: list[str] = []
+    for chunk in raw.replace(";", "\n").replace(",", "\n").split("\n"):
+        for token in chunk.split():
+            d = token.strip().lstrip("@").strip().strip(".").lower()
+            if not d or d.startswith("#"):
+                continue
+            # basic host sanity: no spaces, has a dot or is short label
+            if "://" in d:
+                # allow pasting https://x.com → x.com
+                try:
+                    from urllib.parse import urlparse
+
+                    host = urlparse(d if "://" in d else "https://" + d).hostname or ""
+                    d = host.strip(".").lower()
+                except Exception:
+                    continue
+            if not d or "/" in d or " " in d:
+                continue
+            if d not in parts:
+                parts.append(d)
+    return parts
+
+
+def pick_domain_from_list(
+    text: str | None,
+    *,
+    index: int | None = None,
+    strategy: str = "round_robin",
+) -> str:
+    """Pick one domain from a multi-domain config string.
+
+    - empty list → ""
+    - single → that domain
+    - multi + index → round-robin by index (batch registration)
+    - multi + no index → random
+    """
+    domains = parse_domain_list(text)
+    if not domains:
+        return ""
+    if len(domains) == 1:
+        return domains[0]
+    strat = (strategy or "round_robin").strip().lower()
+    if index is not None:
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            i = 0
+        if i < 0:
+            i = 0
+        return domains[i % len(domains)]
+    if strat in {"random", "rand"}:
+        return random.choice(domains)
+    # default round_robin without index: random is fine for single-shot
+    return random.choice(domains)
+
+
+
 def normalize_cfmail_base_url(base_url: str | None = None) -> str:
     """Normalize Cloudflare Temp Email Workers / Pages URL to API origin.
 
@@ -337,7 +403,7 @@ def moemail_create_mailbox(
         chosen = min(timed, key=lambda p: abs(p - chosen))
     payload: dict[str, Any] = {
         "expiryTime": chosen,
-        "domain": domain or MOEMAIL_DOMAIN,
+        "domain": (pick_domain_from_list(domain) if domain else "") or domain or MOEMAIL_DOMAIN,
     }
     if name:
         payload["name"] = name
@@ -475,7 +541,10 @@ def yyds_create_mailbox(
     base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default / example.com). Empty
     # means auto: randomly pick a healthy public domain from GET /v1/domains.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    # Multi-domain config (newlines/commas) → pick one (random when no index).
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
     if not dom:
         dom = yyds_pick_domain(api_key=key, base_url=base) or ""
     if not dom:
@@ -715,7 +784,10 @@ def gptmail_create_mailbox(
     base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default). Empty => GPTMail
     # random generate / public domain pick.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    # Multi-domain config supported (pick one).
+    dom = pick_domain_from_list(domain) if domain else ""
+    if not dom:
+        dom = (domain or "").strip().lstrip("@").strip(".")
     pre = (name or "").strip().lower() or None
 
     # Prefer server-side generate so we get a real active domain when none given.
@@ -824,12 +896,12 @@ def gptmail_create_mailbox(
     }
 
 
-def gptmail_pick_domain(
+def gptmail_list_domains(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
-) -> str | None:
-    """Pick an active public domain from GPTMail catalog."""
+) -> list[str]:
+    """List active public domains from GPTMail catalog (``GET /api/domains/public``)."""
     base = normalize_gptmail_base_url(base_url or MOEMAIL_BASE_URL)
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     try:
@@ -840,14 +912,16 @@ def gptmail_pick_domain(
                 headers=_headers(key) if key else {},
             )
             if resp.status_code >= 400:
-                return None
+                return []
             data = resp.json()
     except Exception:
-        return None
+        return []
     body = data.get("data") if isinstance(data, dict) and "data" in data else data
     items = body.get("domains") if isinstance(body, dict) else body
     if not isinstance(items, list):
-        return None
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -856,8 +930,24 @@ def gptmail_pick_domain(
             continue
         if item.get("is_active") in (0, False, "0", "false"):
             continue
-        return name.strip().lstrip("@").strip(".")
-    return None
+        name = name.strip().lstrip("@").strip(".")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def gptmail_pick_domain(
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> str | None:
+    """Pick an active public domain from GPTMail catalog."""
+    domains = gptmail_list_domains(api_key=api_key, base_url=base_url)
+    if not domains:
+        return None
+    return random.choice(domains)
 
 
 def gptmail_fetch_messages(

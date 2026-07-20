@@ -28,6 +28,8 @@ var required = map[string][]string{
 	"shell":         {"command"},
 	"localshell":    {"command"},
 	"local_shell":   {"command"},
+	// Hermes agent terminal tool (OpenAI-style "command", not Codex "cmd").
+	"terminal":      {"command"},
 	"exec":          {"command"},
 	"execcommand":   {"command"},
 	"exec_command":  {"command"},
@@ -515,6 +517,8 @@ func isShellToolKey(key string) bool {
 	}
 	switch key {
 	case "bash", "shell", "localshell", "exec", "run", "sh", "zsh", "powershell",
+		// Hermes agent (Nous Research): tool name "terminal", schema param "command".
+		"terminal",
 		"execcommand", "runcommand", "shellcommand", "localshellcommand":
 		return true
 	default:
@@ -528,7 +532,8 @@ func isShellToolKey(key string) bool {
 			}
 		}
 		if strings.HasPrefix(key, "shell") || strings.HasPrefix(key, "exec") ||
-			strings.HasPrefix(key, "bash") || strings.HasPrefix(key, "run") {
+			strings.HasPrefix(key, "bash") || strings.HasPrefix(key, "run") ||
+			strings.HasPrefix(key, "terminal") {
 			return true
 		}
 		return false
@@ -540,6 +545,21 @@ func IsShellTool(name string) bool { return isShellTool(name) }
 
 // NameKey returns the normalized alnum-only tool name key used for alias maps.
 func NameKey(name string) string { return nameKey(name) }
+
+// DefaultShellArgKey returns the client-facing shell parameter name when the
+// request did not advertise a schema (or the tool was missing from ShellArgKeyMap).
+//
+// Codex local tools validate "cmd". Hermes agent (Nous Research) uses tool
+// name "terminal" with required parameter "command" — projecting to cmd makes
+// Hermes drop the payload (args.get("command") is empty).
+func DefaultShellArgKey(name string) string {
+	switch nameKey(name) {
+	case "terminal":
+		return "command"
+	default:
+		return "cmd"
+	}
+}
 
 func isApplyPatchTool(name string) bool {
 	key := nameKey(name)
@@ -2581,7 +2601,8 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	if preferredKey == "" {
 		// Codex validates shell tools against local schema field "cmd".
-		preferredKey = "cmd"
+		// Hermes "terminal" (and any other command-style shell) uses DefaultShellArgKey.
+		preferredKey = DefaultShellArgKey(toolName)
 	}
 	text := strings.TrimSpace(argsJSON)
 	if text == "" {

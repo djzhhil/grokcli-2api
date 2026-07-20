@@ -1138,7 +1138,6 @@ func TestMergeDoesNotInventNewStringMidStream(t *testing.T) {
 	}
 }
 
-
 func TestCoerceSalvageTruncatedShell(t *testing.T) {
 	// Truncated mid-string — classic intermittent upstream cut.
 	raw := `{"cmd":"ls -la /tmp`
@@ -1284,7 +1283,6 @@ func TestCoerceSalvageShellFromCmdKeyOnly(t *testing.T) {
 		}
 	}
 }
-
 
 func TestCoerceSalvagePartialShellAndRead(t *testing.T) {
 	// Truncated mid-string shell args — classic intermittent Codex/Claude hang.

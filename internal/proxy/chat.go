@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -735,8 +736,8 @@ func (c *chatCollector) response() map[string]any {
 }
 
 // preferredShellArgKey resolves the client-facing shell arg name for a tool.
-// Defaults to "cmd" (Codex) for shell-family tools; honors an explicit map from
-// the client tool schema when present.
+// Honors an explicit map from the client tool schema when present; otherwise
+// defaults via toolcall.DefaultShellArgKey (Codex "cmd", Hermes terminal "command").
 func preferredShellArgKey(name string, keys map[string]string) string {
 	if keys != nil {
 		if v := strings.TrimSpace(keys[name]); v != "" {
@@ -752,7 +753,7 @@ func preferredShellArgKey(name string, keys map[string]string) string {
 		}
 	}
 	if toolcall.IsShellTool(name) {
-		return "cmd"
+		return toolcall.DefaultShellArgKey(name)
 	}
 	return ""
 }
@@ -1889,16 +1890,34 @@ func numberToInt64(value any) (int64, bool) {
 	}
 }
 
+// emptyStreamPeekBudget is how long we wait for an *instant* empty HTTP 200
+// ([DONE] with no content/tool_calls) before treating the stream as live.
+// Must stay short so healthy TTFT is not delayed; slow first tokens must never
+// be classified as empty (pass through after budget).
+const emptyStreamPeekBudget = 80 * time.Millisecond
+
 // guardStreamAgainstEmpty peeks upstream SSE until the first model payload or
 // stream end. Empty HTTP 200 bodies can then failover before the client envelope
 // is opened. On success, returns a reader that replays peeked frames + remainder.
 //
-// Ultra-short peek (50ms): only catch instant empty/[DONE], never wait for slow first tokens.
-// On timeout, pass through without treating slow TTFT as empty.
+// Single-reader design: one pump goroutine owns body.Read into an in-memory
+// buffer (pumpedStream). Peek and the client consumer both read that buffer —
+// never two concurrent readers on the HTTP body.
+//
+// The previous implementation returned raw `body` after a 50ms timeout while
+// the peeker was still scanning. That dual-read race dropped frames under
+// medium thinking TTFT (~seconds) and surfaced as intermittent
+// "empty model output (no content/tool_calls)" 502 with ttft_missing.
+//
+// On budget timeout the peeker is interrupted at its next Read wait (no data
+// yet → empty Tee buffer; partial events stay in the pump buffer for the
+// client). OpenStream never dual-reads and never waits for slow first tokens.
 func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 	if body == nil {
 		return nil, true, &grok.UpstreamError{Status: 502, Body: "Upstream returned HTTP 200 with empty model output (no content/tool_calls)"}
 	}
+
+	pumped := newPumpedStream(body)
 
 	type peekResult struct {
 		sawModel bool
@@ -1907,12 +1926,19 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		err      error
 	}
 
+	stopPeek := make(chan struct{})
+	var stopOnce sync.Once
+	requestStop := func() { stopOnce.Do(func() { close(stopPeek) }) }
+
 	resultCh := make(chan peekResult, 1)
 	go func() {
 		var buffered strings.Builder
 		sawModel := false
 		sawDone := false
-		err := grok.ReadSSE(io.TeeReader(body, &buffered), func(event grok.Event) error {
+		// peekerReader can return errStopPeek while waiting for data so the
+		// budget path unblocks without dual-reading the pump.
+		src := &peekerReader{p: pumped, stop: stopPeek}
+		err := grok.ReadSSE(io.TeeReader(src, &buffered), func(event grok.Event) error {
 			if event.Done {
 				sawDone = true
 				return errStopPeek
@@ -1934,30 +1960,180 @@ func guardStreamAgainstEmpty(body io.ReadCloser) (io.ReadCloser, bool, error) {
 		resultCh <- peekResult{sawModel: sawModel, sawDone: sawDone, buffered: buffered.String()}
 	}()
 
-	// Ultra-short empty-stream peek (50ms): only catch instant empty/[DONE], never wait for slow first tokens.
+	finishLive := func(buffered string) io.ReadCloser {
+		replayed := io.MultiReader(strings.NewReader(buffered), pumped)
+		return &multiClose{Reader: replayed, closer: pumped}
+	}
+
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
-			_ = body.Close()
+			_ = pumped.Close()
 			return nil, false, result.err
 		}
 		if !result.sawModel && result.sawDone {
-			// 确实是空响应（收到 [DONE] 但没有内容）
-			_, _ = io.Copy(io.Discard, body)
-			_ = body.Close()
+			_ = pumped.Close()
 			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
 		}
-		// 有内容或者流还在继续 → 正常返回
-		replayed := io.MultiReader(strings.NewReader(result.buffered), body)
-		return &multiClose{Reader: replayed, closer: body}, false, nil
-	case <-time.After(50 * time.Millisecond):
-		// Peek deadline elapsed: pass through without waiting for full first token.
-		// 注意：这里不关闭 body，让它继续流式输出
-		return body, false, nil
+		return finishLive(result.buffered), false, nil
+	case <-time.After(emptyStreamPeekBudget):
+		// Interrupt peeker (unblocks peekerReader wait). Then wait for it so
+		// ownership of the pump is exclusive before the client starts reading.
+		// With no data yet, Tee buffer is empty and finishLive hands the full
+		// pump to the client — same TTFT as the old pass-through, without dual-read.
+		requestStop()
+		result := <-resultCh
+		if result.err != nil {
+			_ = pumped.Close()
+			return nil, false, result.err
+		}
+		// Budget path: even if peeker raced in a Done just after timeout, still
+		// honor true empty (instant hollow after slightly-slow network).
+		if !result.sawModel && result.sawDone {
+			_ = pumped.Close()
+			return io.NopCloser(strings.NewReader(result.buffered)), true, nil
+		}
+		return finishLive(result.buffered), false, nil
 	}
 }
 
 var errStopPeek = errors.New("stop peek")
+
+// peekerReader reads from pumpedStream but can be cancelled via stop while
+// waiting for the first/next bytes (returns errStopPeek without consuming).
+type peekerReader struct {
+	p    *pumpedStream
+	stop <-chan struct{}
+}
+
+func (r *peekerReader) Read(b []byte) (int, error) {
+	if r == nil || r.p == nil {
+		return 0, io.EOF
+	}
+	for {
+		// Fast path: data already buffered.
+		if n, err, ok := r.p.tryRead(b); ok {
+			return n, err
+		}
+		// Wait for data, close, or stop signal.
+		select {
+		case <-r.stop:
+			// Re-check buffer once more in case data arrived with stop.
+			if n, err, ok := r.p.tryRead(b); ok {
+				return n, err
+			}
+			return 0, errStopPeek
+		case <-time.After(5 * time.Millisecond):
+			// Poll: pumpedStream has no per-waiter channel; short poll is fine
+			// for the ~80ms peek window. Cond is still used by pump for batching.
+			continue
+		}
+	}
+}
+
+// pumpedStream is a single-owner pump of an upstream body into an in-memory
+// buffer. Concurrent Read calls are serialized; only the pump goroutine calls
+// src.Read. Peek and client both consume this buffer — no dual body.Read.
+type pumpedStream struct {
+	src    io.ReadCloser
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    bytes.Buffer
+	err    error // set when pump ends (io.EOF or read error)
+	closed bool
+}
+
+func newPumpedStream(src io.ReadCloser) *pumpedStream {
+	p := &pumpedStream{src: src}
+	p.cond = sync.NewCond(&p.mu)
+	go p.pump()
+	return p
+}
+
+func (p *pumpedStream) pump() {
+	tmp := make([]byte, 32*1024)
+	for {
+		n, err := p.src.Read(tmp)
+		p.mu.Lock()
+		if n > 0 {
+			_, _ = p.buf.Write(tmp[:n])
+			p.cond.Broadcast()
+		}
+		if err != nil {
+			if p.err == nil {
+				p.err = err
+			}
+			p.cond.Broadcast()
+			p.mu.Unlock()
+			return
+		}
+		if p.closed {
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Unlock()
+	}
+}
+
+// tryRead returns (n, err, true) when data/EOF/closed is available without blocking.
+func (p *pumpedStream) tryRead(b []byte) (int, error, bool) {
+	if p == nil {
+		return 0, io.EOF, true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.buf.Len() > 0 {
+		n, err := p.buf.Read(b)
+		return n, err, true
+	}
+	if p.closed {
+		return 0, io.ErrClosedPipe, true
+	}
+	if p.err != nil {
+		return 0, p.err, true
+	}
+	return 0, nil, false
+}
+
+func (p *pumpedStream) Read(b []byte) (int, error) {
+	if p == nil {
+		return 0, io.EOF
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for p.buf.Len() == 0 && p.err == nil && !p.closed {
+		p.cond.Wait()
+	}
+	if p.buf.Len() > 0 {
+		return p.buf.Read(b)
+	}
+	if p.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if p.err != nil {
+		return 0, p.err
+	}
+	return 0, io.EOF
+}
+
+func (p *pumpedStream) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	p.cond.Broadcast()
+	src := p.src
+	p.mu.Unlock()
+	if src == nil {
+		return nil
+	}
+	return src.Close()
+}
 
 type multiClose struct {
 	io.Reader

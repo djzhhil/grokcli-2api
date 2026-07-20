@@ -94,17 +94,51 @@ window.G2A = window.G2A || {};
 
   async function api(path, opts = {}) {
     let res;
+    // Optional hard timeout (ms). Registration poll uses this so a hung sidecar
+    // never freezes the log UI for tens of seconds.
+    const timeoutMs = Number(opts.timeoutMs || opts.timeout || 0) || 0;
+    const { timeoutMs: _dropTm, timeout: _dropT, signal: outerSignal, ...fetchOpts } = opts;
+    let abortCtrl = null;
+    let abortTimer = null;
+    let signal = outerSignal;
+    if (timeoutMs > 0) {
+      abortCtrl = new AbortController();
+      if (outerSignal) {
+        if (outerSignal.aborted) abortCtrl.abort();
+        else {
+          try {
+            outerSignal.addEventListener("abort", () => abortCtrl.abort(), { once: true });
+          } catch (_) {}
+        }
+      }
+      signal = abortCtrl.signal;
+      abortTimer = setTimeout(() => {
+        try { abortCtrl.abort(); } catch (_) {}
+      }, timeoutMs);
+    }
     try {
       res = await fetch(API_BASE + path, {
-        ...opts,
+        ...fetchOpts,
+        signal,
         credentials: "same-origin",
         headers: {
-          ...headers(!(opts.body instanceof FormData) && opts.method !== "GET"),
-          ...(opts.headers || {}),
+          ...headers(!(fetchOpts.body instanceof FormData) && fetchOpts.method !== "GET"),
+          ...(fetchOpts.headers || {}),
         },
       });
     } catch (cause) {
+      const aborted = !!(cause && (cause.name === "AbortError" || (signal && signal.aborted)));
+      if (aborted && timeoutMs > 0) {
+        const err = _networkError(path, cause);
+        err.timeout = true;
+        err.message = "请求超时 (" + timeoutMs + "ms)： " + path;
+        throw err;
+      }
       throw _networkError(path, cause);
+    } finally {
+      if (abortTimer) {
+        try { clearTimeout(abortTimer); } catch (_) {}
+      }
     }
     let data = null;
     const ct = (res.headers.get("content-type") || "").toLowerCase();

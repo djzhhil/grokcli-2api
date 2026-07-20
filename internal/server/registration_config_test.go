@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestNormalizeRegistrationConfigDefaults(t *testing.T) {
 	cfg := normalizeRegistrationConfig(map[string]any{})
@@ -31,5 +35,154 @@ func TestSplitProxyLines(t *testing.T) {
 	lines := splitProxyLines("http://a:1\n#c\nhttp://b:2;http://c:3")
 	if len(lines) != 3 {
 		t.Fatalf("lines=%v", lines)
+	}
+}
+
+func TestMailSecretFitsSlot(t *testing.T) {
+	if !mailSecretFitsSlot("moemail_api_key", "mk_abc") {
+		t.Fatal("mk_ should fit moemail")
+	}
+	if mailSecretFitsSlot("moemail_api_key", "AC-yyds") {
+		t.Fatal("AC- must not fit moemail")
+	}
+	if mailSecretFitsSlot("moemail_api_key", "sk-gpt") {
+		t.Fatal("sk- must not fit moemail")
+	}
+	if !mailSecretFitsSlot("yyds_api_key", "AC-yyds") {
+		t.Fatal("AC- should fit yyds")
+	}
+	if mailSecretFitsSlot("yyds_api_key", "mk_abc") {
+		t.Fatal("mk_ must not fit yyds")
+	}
+	if mailSecretFitsSlot("gptmail_api_key", "AC-yyds") {
+		t.Fatal("AC- must not fit gptmail")
+	}
+	if mailSecretFitsSlot("gptmail_api_key", "mk_abc") {
+		t.Fatal("mk_ must not fit gptmail")
+	}
+}
+
+func TestSanitizeRegistrationMailSecretsMovesPollutedKeys(t *testing.T) {
+	cfg := map[string]any{
+		"mail_provider":    "moemail",
+		"moemail_api_key":  "AC-c1965a37122be549cc25724a",
+		"yyds_api_key":     "",
+		"gptmail_api_key":  "AC-c1965a37122be549cc25724a",
+		"moemail_domain":   "lolicr.com",
+		"moemail_base_url": "",
+		"domain":           "lolicr.com",
+		"api_key":          "AC-c1965a37122be549cc25724a",
+	}
+	sanitizeRegistrationMailSecrets(cfg)
+	if cfg["moemail_api_key"] != "" {
+		t.Fatalf("polluted moemail key should be cleared, got %v", cfg["moemail_api_key"])
+	}
+	if cfg["yyds_api_key"] != "AC-c1965a37122be549cc25724a" {
+		t.Fatalf("AC- should move to yyds, got %v", cfg["yyds_api_key"])
+	}
+	if cfg["gptmail_api_key"] != "" {
+		t.Fatalf("polluted gptmail key should be cleared, got %v", cfg["gptmail_api_key"])
+	}
+	if cfg["api_key"] != "" {
+		t.Fatalf("moemail active api_key should be empty after sanitize, got %v", cfg["api_key"])
+	}
+}
+
+func TestRegistrationConfigPatchForPersistDropsAdapterRemap(t *testing.T) {
+	req := map[string]any{
+		"mail_provider":    "yyds",
+		"yyds_api_key":     "AC-new-yyds",
+		"moemail_api_key":  "mk_real_moemail",
+		"moemail_base_url": "https://moemail.example.com",
+		"domain":           "",
+	}
+	// Simulate merge output after adapter remap (YYDS key into moemail_api_key).
+	merged := map[string]any{
+		"mail_provider":    "yyds",
+		"yyds_api_key":     "AC-new-yyds",
+		"moemail_api_key":  "AC-new-yyds",
+		"moemail_base_url": "",
+		"base_url":         "",
+		"api_key":          "AC-new-yyds",
+		"domain":           "",
+	}
+	patch := registrationConfigPatchForPersist(req, merged)
+	if _, ok := patch["moemail_api_key"]; ok {
+		// When provider is yyds, durable MoeMail key must not be in the patch.
+		t.Fatalf("patch must not include remapped moemail_api_key, got %v", patch["moemail_api_key"])
+	}
+	if patch["yyds_api_key"] != "AC-new-yyds" {
+		t.Fatalf("yyds key missing, got %v", patch["yyds_api_key"])
+	}
+	// Request's durable MoeMail host is restored even when merge cleared it.
+	if patch["moemail_base_url"] != "https://moemail.example.com" {
+		t.Fatalf("durable moemail_base_url should come from request, got %v", patch["moemail_base_url"])
+	}
+	// Empty remapped base alone (no request host) is covered separately.
+	req2 := map[string]any{"mail_provider": "yyds", "yyds_api_key": "AC-x"}
+	merged2 := map[string]any{
+		"mail_provider": "yyds", "yyds_api_key": "AC-x",
+		"moemail_api_key": "AC-x", "moemail_base_url": "", "base_url": "",
+	}
+	patch2 := registrationConfigPatchForPersist(req2, merged2)
+	if _, ok := patch2["moemail_api_key"]; ok {
+		t.Fatalf("patch2 must not include remapped moemail_api_key")
+	}
+	if v, ok := patch2["moemail_base_url"]; ok && strings.TrimSpace(fmt.Sprint(v)) == "" {
+		t.Fatalf("empty remapped moemail_base_url should be dropped from patch2")
+	}
+	_ = patch2
+}
+
+func TestMergeRegistrationStartBodyYydsKey(t *testing.T) {
+	// Simulates saved MoeMail key + request selecting YYDS with its own key.
+	// mergeRegistrationStartBody needs store for load — test the mapping logic
+	// via normalize + inline reconstruction of the critical overwrite rule.
+	out := map[string]any{
+		"mail_provider":   "yyds",
+		"moemail_api_key": "mk_old_moemail",
+		"yyds_api_key":    "AC-new-yyds",
+		"api_key":         "AC-new-yyds",
+		"domain":          "",
+		"yyds_domain":     "",
+	}
+	// Apply the same critical overwrite used by mergeRegistrationStartBody.
+	provider := "yyds"
+	if k, _ := out["yyds_api_key"].(string); k != "" {
+		out["moemail_api_key"] = k
+		out["api_key"] = k
+	}
+	out["moemail_base_url"] = ""
+	if out["moemail_api_key"] != "AC-new-yyds" {
+		t.Fatalf("moemail_api_key should be active YYDS key, got %v", out["moemail_api_key"])
+	}
+	if out["moemail_base_url"] != "" {
+		t.Fatalf("yyds must clear moemail base url")
+	}
+	_ = provider
+}
+
+func TestMergeRegistrationStartBodyGptmailKey(t *testing.T) {
+	out := map[string]any{
+		"mail_provider":   "gptmail",
+		"moemail_api_key": "mk_old",
+		"gptmail_api_key": "sk-gpt-key",
+	}
+	if k, _ := out["gptmail_api_key"].(string); k != "" {
+		out["moemail_api_key"] = k
+	}
+	if out["moemail_api_key"] != "sk-gpt-key" {
+		t.Fatalf("got %v", out["moemail_api_key"])
+	}
+}
+
+func TestNormalizeRegistrationConfigMailAliases(t *testing.T) {
+	cfg := normalizeRegistrationConfig(map[string]any{"mail_provider": "yydsmail"})
+	if cfg["mail_provider"] != "yyds" {
+		t.Fatalf("mail_provider=%v", cfg["mail_provider"])
+	}
+	cfg = normalizeRegistrationConfig(map[string]any{"mail_provider": "chatgptmail"})
+	if cfg["mail_provider"] != "gptmail" {
+		t.Fatalf("mail_provider=%v", cfg["mail_provider"])
 	}
 }

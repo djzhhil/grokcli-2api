@@ -40,7 +40,7 @@ var unsupportedUpstreamParams = map[string]bool{
 	"group":                    true,
 	// Client-only metadata (Codex session/client hints). Stripped after compact
 	// detection so LooksLikeCodexRequest can still see metadata.client.
-	"metadata":                 true,
+	"metadata": true,
 }
 
 func SanitizeUpstreamBody(body map[string]any) map[string]any {

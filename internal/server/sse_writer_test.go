@@ -76,3 +76,41 @@ var _ interface {
 	Write([]byte) (int, error)
 	Flush()
 } = (*softFailRecorder)(nil)
+
+func TestSSEWriterShortWriteLastWritten(t *testing.T) {
+	// Soft short-write must expose LastWritten so coalescers can advance the buffer
+	// and re-send only the unsent tail (avoids duplicate prefix / truncated text).
+	soft := &softFailRecorder{ResponseRecorder: httptest.NewRecorder(), failWrites: 1, failAny: true, shortWrite: true}
+	sw := newSSEWriter(soft, soft, context.Background())
+	payload := []byte("data: hello-world-this-is-long-enough\n\n")
+	if err := sw.WriteBytes(payload, true); err != nil {
+		t.Fatalf("soft short write should swallow, got %v", err)
+	}
+	if sw.LastOK() {
+		t.Fatal("short write must leave lastOK=false")
+	}
+	if !sw.SoftGone() {
+		t.Fatal("short write must mark softGone")
+	}
+	n := sw.LastWritten()
+	if n <= 0 || n >= len(payload) {
+		t.Fatalf("LastWritten=%d want (0, %d)", n, len(payload))
+	}
+	// Force retry of the remainder only — full body must eventually land without
+	// re-sending the accepted prefix as a second full payload.
+	tail := payload[n:]
+	if err := sw.WriteBytes(tail, true); err != nil {
+		t.Fatal(err)
+	}
+	if !sw.LastOK() {
+		t.Fatal("force tail write expected lastOK")
+	}
+	body := soft.Body.String()
+	if !strings.Contains(body, "hello-world") {
+		t.Fatalf("expected full text across short+retry, body=%q", body)
+	}
+	// No duplicated full SSE frame (prefix+full would double the event).
+	if strings.Count(body, "data: hello-world-this-is-long-enough") > 1 {
+		t.Fatalf("duplicated full frame (coalesce should advance by LastWritten): %q", body)
+	}
+}

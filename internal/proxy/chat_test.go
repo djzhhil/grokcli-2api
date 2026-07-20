@@ -461,10 +461,12 @@ func TestPrepareChainCapsFailover(t *testing.T) {
 }
 
 func TestGuardStreamAgainstEmptySlowFirstTokenPasses(t *testing.T) {
-	// Slow TTFT: no frames within the 1s peek window must NOT be treated as empty.
+	// Slow TTFT: no frames within the peek budget must NOT be treated as empty.
+	// After budget, the guarded reader must still deliver the late content
+	// (single-reader pump; no dual-read race dropping frames).
 	pr, pw := io.Pipe()
 	go func() {
-		time.Sleep(1200 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n"))
 		_ = pw.Close()
 	}()
@@ -478,7 +480,55 @@ func TestGuardStreamAgainstEmptySlowFirstTokenPasses(t *testing.T) {
 	if guarded == nil {
 		t.Fatal("expected reader")
 	}
-	_ = guarded.Close()
+	defer guarded.Close()
+	var got strings.Builder
+	err = grok.ReadSSE(guarded, func(event grok.Event) error {
+		if event.Done {
+			return nil
+		}
+		got.Write(event.Data)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.String(), "late") {
+		t.Fatalf("slow first token content lost after peek budget: %q", got.String())
+	}
+}
+
+func TestGuardStreamAgainstEmptyDoesNotDualRead(t *testing.T) {
+	// Regression: returning raw body while peeker still scanned caused dual Read
+	// and intermittent empty 502 under medium thinking TTFT.
+	// Content arrives just after the peek budget; client must still see it.
+	pr, pw := io.Pipe()
+	go func() {
+		// Hollow keepalive-like frames first (usage-only / empty delta), then content.
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{}}]}\n\n"))
+		time.Sleep(emptyStreamPeekBudget + 30*time.Millisecond)
+		_, _ = pw.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"after-budget\"}}]}\n\ndata: [DONE]\n\n"))
+		_ = pw.Close()
+	}()
+	guarded, empty, err := guardStreamAgainstEmpty(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty {
+		t.Fatalf("must not treat delayed content as empty")
+	}
+	defer guarded.Close()
+	var got strings.Builder
+	if err := grok.ReadSSE(guarded, func(event grok.Event) error {
+		if !event.Done {
+			got.Write(event.Data)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got.String(), "after-budget") {
+		t.Fatalf("content after peek budget lost (dual-read race?): %q", got.String())
+	}
 }
 
 func TestChatFingerprintPrefersPromptCacheKey(t *testing.T) {

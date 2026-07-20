@@ -57,6 +57,10 @@ type LiveStreamer struct {
 	pendingTerminal bool
 	// terminalEmitted: Complete was successfully written (AckTerminal).
 	terminalEmitted bool
+	// contentDelivered: text/reasoning frames survived a successful Write+Flush.
+	// Distinct from text/reasoning non-empty (produced) — soft-fail before Ack
+	// must not count as client-visible for TTFT / soft-close decisions.
+	contentDelivered bool
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -95,8 +99,8 @@ func (s *LiveStreamer) projectArgs(toolName, args string) string {
 	if s == nil || args == "" {
 		return args
 	}
-	// Codex validates local schema field "cmd". Default ALL shell-family tools to cmd.
-	// Only keep "command" when the client tool schema explicitly has command and NOT cmd.
+	// Prefer client tool schema key when known (Codex: "cmd"; Hermes terminal: "command").
+	// Fall back to DefaultShellArgKey for shell-family tools without a map entry.
 	preferred := ""
 	if s.shellArgKeys != nil {
 		if v := strings.TrimSpace(s.shellArgKeys[toolName]); v != "" {
@@ -109,10 +113,15 @@ func (s *LiveStreamer) projectArgs(toolName, args string) string {
 			}
 		}
 	}
-	// Hard rule: any shell tool (exec_command/shell/bash/...) defaults to cmd.
-	// Pure OpenAI command-only tools are rare; if keys map says "command" we honor it.
+	// Hard rule: shell-family tools always project. Prefer schema map; else
+	// DefaultShellArgKey (Codex "cmd", Hermes terminal "command").
+	// Pure OpenAI command-only schemas are honored when keys map says "command".
 	if preferred == "" {
-		if toolcall.IsShellTool(toolName) || looksLikeShellArgs(args) {
+		if toolcall.IsShellTool(toolName) {
+			preferred = toolcall.DefaultShellArgKey(toolName)
+		} else if looksLikeShellArgs(args) {
+			// Unknown/custom tool name but payload looks like a shell call —
+			// Codex is the common case that needs cmd projection.
 			preferred = "cmd"
 		} else {
 			return args
@@ -425,13 +434,24 @@ func (s *LiveStreamer) HasClientPayload() bool {
 	return false
 }
 
+// toolCapReached is true when the outbound max-tools policy has already emitted
+// its full budget. Remaining complete tools must be treated as dropped — not
+// "pending" — otherwise Complete/NeedsFinishRetry re-emit response.completed
+// in a loop (Claude Code "Tool use interrupted" on Read/Write multi-tool turns).
+func (s *LiveStreamer) toolCapReached() bool {
+	return s != nil && s.maxTools > 0 && s.toolsStarted >= s.maxTools
+}
+
 // HasPendingTools reports whether any tool args are buffered but not yet
 // emitted (incomplete JSON). Used by the server to keep the client SSE warm
 // while we hold incomplete function_call frames — otherwise proxies cut the
 // stream during multi-second tool-arg drips (upstream not idle, so ReadSSE
 // keepalive never fires, and the client sees silence).
+//
+// When the max-tools cap is already filled, excess tools are never emitted and
+// do not count as pending (avoids duplicate response.completed after cap).
 func (s *LiveStreamer) HasPendingTools() bool {
-	if s == nil {
+	if s == nil || s.toolCapReached() {
 		return false
 	}
 	for _, state := range s.tools {
@@ -489,6 +509,64 @@ func (s *LiveStreamer) TerminalDelivered() bool {
 	return s != nil && s.terminalEmitted
 }
 
+// PayloadDelivered is true when the client has already received useful output:
+// text/reasoning that survived Write+Flush (contentDelivered), or at least one
+// tool that was client-Ack'd. Unlike HasClientPayload (true as soon as frames
+// are *produced*), this only counts content that landed on the wire.
+//
+// Used after recovery exhaustion so we soft-close a real delivery instead of
+// Fail("empty model output") when only response.completed soft-failed —
+// that false empty is what Claude Code surfaces as intermittent
+// "Tool use interrupted" with admin ok=false tokens=0 ttft>0.
+func (s *LiveStreamer) PayloadDelivered() bool {
+	if s == nil {
+		return false
+	}
+	if s.contentDelivered {
+		return true
+	}
+	for _, state := range s.tools {
+		if state != nil && state.clientAcked {
+			return true
+		}
+	}
+	return false
+}
+
+// AckContentDelivered marks text/reasoning frames as successfully written.
+// Call after a Write+Flush of non-tool payload (output_text / reasoning deltas).
+func (s *LiveStreamer) AckContentDelivered() {
+	if s == nil {
+		return
+	}
+	if s.text != "" || s.reasoning != "" || s.textOpen || s.reasoningOpen {
+		s.contentDelivered = true
+	}
+}
+
+// HalfOpenTools is true when any tool was framed (emitted) but never client-Ack'd.
+// That is the real "Tool use interrupted" case — not a missing terminal alone.
+func (s *LiveStreamer) HalfOpenTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state != nil && state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	for _, idx := range s.pendingClientAcks {
+		state := s.tools[idx]
+		if state == nil {
+			return true
+		}
+		if state.emitted && !state.clientAcked {
+			return true
+		}
+	}
+	return false
+}
+
 // ClientDeliveryOK reports a fully closed Responses turn safe for ok=true:
 //   - terminal (response.completed) must be Ack'd, AND
 //   - either text/reasoning was framed, or at least one tool was client-Ack'd.
@@ -526,6 +604,44 @@ func (s *LiveStreamer) ClientDeliveryOK() bool {
 	}
 	// Envelope-only / empty: not OK.
 	return false
+}
+
+// OutputChars counts framed text/reasoning/tool-arg runes for usage fallback.
+// Used when upstream omits the usage frame (soft-close / short tool turns) so
+// admin does not record ok=true with all-zero tokens (hollow success).
+func (s *LiveStreamer) OutputChars() int {
+	if s == nil {
+		return 0
+	}
+	n := len([]rune(s.text)) + len([]rune(s.reasoning))
+	for _, state := range s.tools {
+		if state == nil || !(state.emitted || state.clientAcked) {
+			continue
+		}
+		n += len([]rune(state.name)) + len([]rune(state.arguments))
+	}
+	return n
+}
+
+// EstimateOutputTokens approximates completion tokens (~4 runes/token).
+// Returns at least 1 when ClientDeliveryOK-style payload exists but chars==0
+// (rare name-only tool edge); 0 when there is no client payload at all.
+func (s *LiveStreamer) EstimateOutputTokens() int {
+	if s == nil {
+		return 0
+	}
+	chars := s.OutputChars()
+	if chars > 0 {
+		tok := (chars + 3) / 4
+		if tok < 1 {
+			tok = 1
+		}
+		return tok
+	}
+	if s.HasClientPayload() {
+		return 1
+	}
+	return 0
 }
 
 // UndeliveredTools is true when any tool was framed but never client-Ack'd.
@@ -568,8 +684,10 @@ func (s *LiveStreamer) NeedsFinishRetry() bool {
 }
 
 // hasReadyUnemittedTools reports a non-emitted tool that force-finish can still emit.
+// Respects maxTools: once the outbound cap is full, extra complete tools are dropped
+// and must not keep NeedsFinishRetry / Complete looping.
 func (s *LiveStreamer) hasReadyUnemittedTools() bool {
-	if s == nil {
+	if s == nil || s.toolCapReached() {
 		return false
 	}
 	for _, state := range s.tools {

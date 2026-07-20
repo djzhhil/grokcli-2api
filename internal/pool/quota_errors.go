@@ -3,7 +3,9 @@ package pool
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -54,7 +56,7 @@ var (
 // Decision priority is body/code text first, status second:
 //  1. free-usage / 额度用完 phrasing → hard account cooldown only (no model block)
 //  2. billing hard-quota → long cooldown
-//  3. empty model output / no content/tool_calls (HTTP 200 glitch) → ultra-short cool
+//  3. empty model output / no content/tool_calls → model soft-block (模型封禁) + cool
 //  4. model capacity / overloaded → short cool
 //  5. auth 401/403 → short cool
 //  6. bare rate-limit / 429 without quota language → shorter cool
@@ -154,20 +156,32 @@ func ClassifyUpstreamFailure(status int, errText string, requestedModel ...strin
 		return d
 	}
 
-	// Empty HTTP 200 / empty model output is a transient upstream glitch.
-	// Python uses a sticky skip of 8–20s (not multi-minute 5xx cool) so the pool
-	// is not emptied under load. Status is often rewritten to 502 by the proxy
-	// path; body text must win over status classification.
+	// Empty HTTP 200 / empty model output: soft-block the requested model so the
+	// account shows under admin「模型封禁」and is skipped for that model only.
+	// Do NOT sticky-cool the whole account (other models stay pickable).
+	// Status is often rewritten to 502 by the proxy path; body text must win over
+	// bare 5xx classification.
 	if isEmptyModelOutputText(low) || isEmptyModelOutputCode(codeFromJSON) {
-		until := time.Now().Add(12 * time.Second)
+		// Default 10 minutes — visible in admin chips; self-heals without manual unblock.
+		// Override via GROK2API_EMPTY_OUTPUT_BLOCK_SEC (30–86400).
+		blockSec := 10 * 60
+		if v := strings.TrimSpace(os.Getenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 30 && n <= 24*3600 {
+				blockSec = n
+			}
+		}
+		until := time.Now().Add(time.Duration(blockSec) * time.Second)
+		bm := defaultModel(model)
 		return CooldownDecision{
-			Class:          ClassEmptyUpstream,
-			Code:           string(ClassEmptyUpstream),
-			Model:          model,
-			Until:          &until,
-			ShouldCooldown: true,
-			BlockModel:     false,
-			Reason:         firstNonEmpty(text, "empty model output"),
+			Class: ClassEmptyUpstream,
+			Code:  string(ClassEmptyUpstream),
+			Model: bm,
+			Until: &until,
+			// Account-wide cool would tag the row as 冷却 and hide it from 模型封禁.
+			ShouldCooldown: false,
+			// Soft-block the model → pool_status=model_blocked + picker skip.
+			BlockModel: bm != "",
+			Reason:     firstNonEmpty(text, "empty model output"),
 		}
 	}
 

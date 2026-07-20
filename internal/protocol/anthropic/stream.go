@@ -67,6 +67,10 @@ type StreamAssembler struct {
 	// (successfully written). Soft-write recovery Finish may re-emit tools without
 	// duplicating the terminal envelope (Claude Code rejects double message_stop).
 	terminalEmitted bool
+	// contentDelivered: text/thinking frames survived a successful Write+Flush.
+	// Distinct from textBlock/thinkingBlock being open (produced) — soft-fail
+	// before Ack must not count as client-visible for TTFT / soft-close.
+	contentDelivered bool
 }
 
 type heldDelta struct {
@@ -198,9 +202,17 @@ func (s *StreamAssembler) HasClientPayload() bool {
 	return false
 }
 
+// toolCapReached is true when the outbound max-tools policy has already emitted
+// its full budget. Excess tools are permanently dropped and must not look pending
+// (avoids message_stop re-emit loops → Claude Code "Tool use interrupted").
+func (s *StreamAssembler) toolCapReached() bool {
+	return s != nil && s.maxTools > 0 && s.toolsStarted >= s.maxTools
+}
+
 // HasPendingTools reports buffered but not-yet-emitted tool arguments.
+// When the max-tools cap is filled, excess tools do not count as pending.
 func (s *StreamAssembler) HasPendingTools() bool {
-	if s == nil {
+	if s == nil || s.toolCapReached() {
 		return false
 	}
 	for _, state := range s.tools {
@@ -222,6 +234,34 @@ func (s *StreamAssembler) HasHeldContent() bool {
 		return false
 	}
 	return len(s.held) > 0
+}
+
+// OutputRunes returns accumulated text/thinking/tool-arg runes for usage fallback
+// when upstream omits the usage frame (soft-close / short tool turns).
+func (s *StreamAssembler) OutputRunes() int {
+	if s == nil {
+		return 0
+	}
+	return s.outputRunes
+}
+
+// EstimateOutputTokens approximates completion tokens (~4 runes/token).
+// Returns at least 1 when a client payload exists; 0 when the stream was empty.
+func (s *StreamAssembler) EstimateOutputTokens() int {
+	if s == nil {
+		return 0
+	}
+	if s.outputRunes > 0 {
+		tok := s.outputRunes / 4
+		if tok < 1 {
+			tok = 1
+		}
+		return tok
+	}
+	if s.HasClientPayload() {
+		return 1
+	}
+	return 0
 }
 
 // NeedsClientKeepalive is true when the assembler is buffering work the client
@@ -256,6 +296,67 @@ func (s *StreamAssembler) HasUnackedTools() bool {
 // this false so the server can Finish again after Requeue.
 func (s *StreamAssembler) TerminalDelivered() bool {
 	return s != nil && s.terminalEmitted
+}
+
+// PayloadDelivered is true when the client has already received useful output:
+// text/thinking that survived Write+Flush (contentDelivered), or at least one
+// tool that was client-Ack'd. Unlike HasClientPayload (true as soon as frames
+// are produced or held), this only counts content that landed on the wire.
+//
+// Used after recovery exhaustion so we soft-close a real delivery instead of
+// TerminalError("empty model output") when only message_stop soft-failed —
+// that false empty is intermittent Claude Code "Tool use interrupted".
+func (s *StreamAssembler) PayloadDelivered() bool {
+	if s == nil {
+		return false
+	}
+	if s.contentDelivered {
+		return true
+	}
+	// Open text/thinking blocks only after emitFrames LastOK path advanced them
+	// (assembler state is not rolled back on soft text fail; contentDelivered is
+	// the precise signal — keep open-block as secondary for older call sites).
+	if s.textBlock >= 0 || s.thinkingBlock >= 0 {
+		return true
+	}
+	for _, state := range s.tools {
+		if state != nil && state.clientAcked {
+			return true
+		}
+	}
+	return false
+}
+
+// AckContentDelivered marks text/thinking frames as successfully written.
+// Call after a Write+Flush of non-tool payload (text_delta / thinking_delta).
+func (s *StreamAssembler) AckContentDelivered() {
+	if s == nil {
+		return
+	}
+	if s.outputRunes > 0 || s.textBlock >= 0 || s.thinkingBlock >= 0 {
+		s.contentDelivered = true
+	}
+}
+
+// HalfOpenTools is true when any tool_use was started (framed) but never client-Ack'd.
+func (s *StreamAssembler) HalfOpenTools() bool {
+	if s == nil {
+		return false
+	}
+	for _, state := range s.tools {
+		if state != nil && state.started && !state.clientAcked {
+			return true
+		}
+	}
+	if len(s.pendingClientAcks) > 0 {
+		for _, idx := range s.pendingClientAcks {
+			state := s.tools[idx]
+			if state == nil || (state.started && !state.clientAcked) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ClientDeliveryOK reports a fully closed Anthropic turn safe for ok=true:
@@ -318,8 +419,9 @@ func (s *StreamAssembler) NeedsFinishRetry() bool {
 
 // hasReadyUnemittedTools is true when a non-started tool would pass force-finish
 // CompleteJSON after coercion — i.e. Finish can still emit a real tool_use group.
+// Respects the outbound max-tools cap so capped excess tools do not retry Finish.
 func (s *StreamAssembler) hasReadyUnemittedTools() bool {
-	if s == nil {
+	if s == nil || s.toolCapReached() {
 		return false
 	}
 	for _, state := range s.tools {

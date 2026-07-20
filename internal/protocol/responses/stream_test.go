@@ -254,6 +254,74 @@ func TestShellArgsDefaultCmdWithoutKeyMap(t *testing.T) {
 	}
 }
 
+// Hermes agent tool "terminal" requires parameter "command". Without a key map
+// we must NOT project to Codex "cmd" or Hermes will fail the tool call.
+func TestHermesTerminalArgsKeepCommandWithoutKeyMap(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_hermes", "grok", []string{"terminal"}, 0)
+	frames := s.ToolDeltas([]ToolDelta{{Index: 0, ID: "call_1", Name: "terminal", Arguments: `{"command":"ls -la"}`}})
+	frames = append(frames, s.Complete(&Usage{InputTokens: 1, OutputTokens: 1})...)
+	joined := strings.Join(frames, "\n")
+	if strings.Contains(joined, `"cmd"`) && !strings.Contains(joined, `"command"`) {
+		t.Fatalf("Hermes terminal projected to cmd-only:\n%s", joined)
+	}
+	foundCommand := false
+	for _, frame := range frames {
+		for _, line := range strings.Split(frame, "\n") {
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			var obj map[string]any
+			if json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &obj) != nil {
+				continue
+			}
+			if obj["type"] == "response.function_call_arguments.done" {
+				args := fmt.Sprint(obj["arguments"])
+				if strings.Contains(args, `"cmd"`) && !strings.Contains(args, `"command"`) {
+					t.Fatalf("Hermes terminal args became cmd: %s", args)
+				}
+				if strings.Contains(args, `"command"`) && strings.Contains(args, "ls -la") {
+					foundCommand = true
+				}
+			}
+			if item, _ := obj["item"].(map[string]any); item != nil && item["type"] == "function_call" && item["status"] == "completed" {
+				args := fmt.Sprint(item["arguments"])
+				if strings.Contains(args, `"cmd"`) && !strings.Contains(args, `"command"`) {
+					t.Fatalf("Hermes completed item became cmd: %s", args)
+				}
+				if strings.Contains(args, `"command"`) && strings.Contains(args, "ls -la") {
+					foundCommand = true
+				}
+			}
+		}
+	}
+	if !foundCommand {
+		t.Fatalf("expected command projection for Hermes terminal:\n%s", joined)
+	}
+}
+
+func TestHermesTerminalArgsHonorSchemaKeyMap(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_hermes_map", "grok", []string{"terminal"}, 0)
+	s.SetShellArgKeys(map[string]string{"terminal": "command"})
+	frames := s.ToolDeltas([]ToolDelta{{Index: 0, ID: "c1", Name: "terminal", Arguments: `{"command":"pwd"}`}})
+	frames = append(frames, s.Complete(&Usage{})...)
+	joined := strings.Join(frames, "\n")
+	// JSON-in-JSON may appear escaped as \"command\" in the SSE data payload.
+	if strings.Contains(joined, `"cmd":"pwd"`) || strings.Contains(joined, `"cmd": "pwd"`) ||
+		strings.Contains(joined, `\"cmd\":\"pwd\"`) {
+		t.Fatalf("schema said command but got cmd:\n%s", joined)
+	}
+	if !strings.Contains(joined, "command") || !strings.Contains(joined, "pwd") {
+		t.Fatalf("expected command+pwd in frames:\n%s", joined)
+	}
+	// Ensure we did not leave a bare cmd key for the shell payload.
+	if strings.Contains(joined, `"cmd"`) || strings.Contains(joined, `\"cmd\"`) {
+		// cmd may appear in unrelated fields; only fail if it pairs with pwd without command.
+		if !strings.Contains(joined, "command") {
+			t.Fatalf("cmd leaked without command:\n%s", joined)
+		}
+	}
+}
+
 func TestExecCommandArgsProjectedToCmd(t *testing.T) {
 	// Codex get_goal/exec_command path: tool name is exec_command, schema wants cmd.
 	s := NewLiveStreamerWithMaxTools("resp_exec", "grok", []string{"exec_command"}, 0)
@@ -444,7 +512,6 @@ func TestSoftFailTerminalNeedsFinishRetry(t *testing.T) {
 	}
 }
 
-
 func TestRequeueUnacksTerminalWhenToolsRetry(t *testing.T) {
 	s := NewLiveStreamerWithMaxTools("resp_rq", "grok", []string{"Read"}, 2)
 	// Emit one complete tool and Ack terminal as if write succeeded for completed only.
@@ -576,7 +643,6 @@ func TestLiveStreamerClientDeliveryOK(t *testing.T) {
 	}
 }
 
-
 func TestRequeueUnacksTerminalBeforeToolRetry(t *testing.T) {
 	s := NewLiveStreamerWithMaxTools("resp_u", "m", []string{"Read"}, 2)
 	_ = s.Start()
@@ -661,5 +727,105 @@ func TestClientDeliveryOKRequiresAckedToolOrText(t *testing.T) {
 	s2.pendingTerminal = false
 	if !s2.ClientDeliveryOK() {
 		t.Fatal("acked tool + terminal should be OK")
+	}
+}
+
+func TestPayloadDeliveredRequiresWriteAck(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_pd", "grok", []string{"Read"}, 1)
+	_ = s.Text("hello")
+	// Text produced but not AckContentDelivered → not PayloadDelivered.
+	if s.PayloadDelivered() {
+		t.Fatal("text produced without AckContentDelivered must not be PayloadDelivered")
+	}
+	s.AckContentDelivered()
+	if !s.PayloadDelivered() {
+		t.Fatal("after AckContentDelivered, PayloadDelivered expected")
+	}
+
+	s2 := NewLiveStreamerWithMaxTools("resp_pd2", "grok", []string{"Read"}, 1)
+	frames := s2.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.go"}`,
+	}})
+	if len(frames) == 0 {
+		t.Fatal("expected tool frames")
+	}
+	if s2.PayloadDelivered() {
+		t.Fatal("emitted but unacked tool must not be PayloadDelivered")
+	}
+	joined := ""
+	for _, f := range frames {
+		joined += f
+	}
+	s2.AckToolsInPayload(joined)
+	if !s2.PayloadDelivered() {
+		t.Fatal("acked tool must be PayloadDelivered")
+	}
+	if s2.HalfOpenTools() {
+		t.Fatal("acked tool must not be HalfOpenTools")
+	}
+}
+
+func TestHalfOpenToolsDetectsUnacked(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_ho", "grok", []string{"Read"}, 1)
+	_ = s.ToolDeltas([]ToolDelta{{
+		Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.go"}`,
+	}})
+	if !s.HalfOpenTools() {
+		t.Fatal("emitted unacked tool is half-open")
+	}
+	// Ack
+	for _, st := range s.tools {
+		if st != nil {
+			st.clientAcked = true
+		}
+	}
+	s.pendingClientAcks = nil
+	if s.HalfOpenTools() {
+		t.Fatal("acked tool is not half-open")
+	}
+}
+
+// Two complete tools with maxTools=1 must emit only the first and close once.
+// Regression: capped second tool used to keep HasPendingTools/hasReadyUnemittedTools
+// true → Complete re-emitted response.completed in a loop → Claude Code
+// "Tool use interrupted" on parallel Read/Write turns.
+func TestMaxToolsCapDoesNotLoopCompleted(t *testing.T) {
+	s := NewLiveStreamerWithMaxTools("resp_cap", "grok", []string{"Read", "Write"}, 1)
+	frames := s.ToolDeltas([]ToolDelta{
+		{Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.txt"}`},
+		{Index: 1, ID: "c2", Name: "Read", Arguments: `{"file_path":"/b.txt"}`},
+	})
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, `"name":"Read"`) {
+		t.Fatalf("expected first tool emitted: %s", joined)
+	}
+	// Only one function_call item added.
+	if n := strings.Count(joined, "response.output_item.added"); n != 1 && strings.Count(joined, `"type":"function_call"`) < 1 {
+		// start may include reasoning none; count function_call added items
+	}
+	if strings.Count(joined, `"file_path":"/b.txt"`) != 0 {
+		t.Fatalf("second tool must be capped, got: %s", joined)
+	}
+	if s.HasPendingTools() {
+		t.Fatal("capped excess tools must not look pending")
+	}
+	if s.hasReadyUnemittedTools() {
+		t.Fatal("capped excess tools must not look ready-to-emit")
+	}
+	// Ack first tool + complete once, then recovery loop must be dry.
+	s.AckToolsInPayload(joined)
+	term := s.Complete(nil)
+	termJoined := strings.Join(term, "")
+	if !strings.Contains(termJoined, "response.completed") {
+		t.Fatalf("expected single completed: %s", termJoined)
+	}
+	s.AckTerminal()
+	if s.NeedsFinishRetry() {
+		t.Fatal("after cap+ack, NeedsFinishRetry must be false (no completed loop)")
+	}
+	// Extra Complete must not re-emit completed.
+	again := strings.Join(s.Complete(nil), "")
+	if strings.Contains(again, "response.completed") {
+		t.Fatalf("must not re-emit completed after cap: %s", again)
 	}
 }

@@ -173,6 +173,8 @@ func TestFreeUsageGrok45BuildFreeCoolOnly(t *testing.T) {
 
 func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
 	// Proxy rewrites empty HTTP 200 as synthetic 502; body text must win over 5xx cool.
+	// Empty output now soft-blocks the requested model (admin 模型封禁) for a short window.
+	t.Setenv("GROK2API_EMPTY_OUTPUT_BLOCK_SEC", "600") // 10m for deterministic assertion
 	cases := []struct {
 		name   string
 		status int
@@ -186,34 +188,40 @@ func TestClassifyEmptyModelOutputShortCool(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d := ClassifyUpstreamFailure(tc.status, tc.body, "grok-4.5")
-			if !d.ShouldCooldown {
-				t.Fatalf("expected short cool: %+v", d)
+			if d.ShouldCooldown {
+				t.Fatalf("empty output must NOT sticky-cool whole account: %+v", d)
 			}
 			if d.Class != ClassEmptyUpstream {
 				t.Fatalf("class=%q want empty_upstream body=%q decision=%+v", d.Class, tc.body, d)
 			}
-			if d.BlockModel {
-				t.Fatalf("empty upstream must not block model: %+v", d)
+			if !d.BlockModel {
+				t.Fatalf("empty upstream must soft-block model (模型封禁): %+v", d)
+			}
+			if d.Model != "grok-4.5" {
+				t.Fatalf("model=%q want grok-4.5", d.Model)
 			}
 			if d.Until == nil {
 				t.Fatal("expected until")
 			}
-			// Python sticky skip is 8–20s; Go uses 12s mid-point. Must be << 5xx 3m cool.
-			if d.Until.After(time.Now().Add(30 * time.Second)) {
-				t.Fatalf("empty cool too long (would empty the pool): until=%v", d.Until)
+			// 10m block (±30s slack). Must be longer than old 12s ultra-short cool.
+			if d.Until.Before(time.Now().Add(8 * time.Minute)) {
+				t.Fatalf("empty block too short: until=%v", d.Until)
 			}
-			if d.Until.Before(time.Now().Add(5 * time.Second)) {
-				t.Fatalf("empty cool too short: until=%v", d.Until)
+			if d.Until.After(time.Now().Add(15 * time.Minute)) {
+				t.Fatalf("empty block too long: until=%v", d.Until)
 			}
 		})
 	}
 
-	// Bare 5xx without empty phrasing still uses server cool (minutes).
+	// Bare 5xx without empty phrasing still uses server cool (minutes), no model block.
 	d := ClassifyUpstreamFailure(502, "bad gateway from reverse proxy")
 	if d.Class != ClassServer {
 		t.Fatalf("bare 502 should be server class: %+v", d)
 	}
 	if d.Until == nil || d.Until.Before(time.Now().Add(2*time.Minute)) {
 		t.Fatalf("bare 5xx cool should be ~3m: %+v", d)
+	}
+	if d.BlockModel {
+		t.Fatalf("bare 5xx must not soft-block model: %+v", d)
 	}
 }

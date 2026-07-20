@@ -285,11 +285,11 @@ func ConvertTools(raw any) []any {
 	return out
 }
 
-// ReasoningEffort returns a canonical low|medium|high|xhigh for Responses bodies.
-// Accepts Codex labels (auto/default/standard/extra-high) and Claude-style
-// thinking budgets via the shared normalizer.
+// ReasoningEffort returns a Grok-safe low|medium|high for Responses bodies.
+// Accepts Claude Code (low|medium|high|xhigh|max|ultracode), Codex
+// (Low/Base/High/Ultra/Proactive + auto/default/standard/extra-high), and thinking budgets — then folds to 3 tiers.
 func ReasoningEffort(raw map[string]any) string {
-	return reasoning.FromRequest(raw)
+	return reasoning.FromRequestUpstream(raw)
 }
 
 func BuildObject(responseID, model, content, reasoning string, toolCalls []map[string]any, usage map[string]any, createdAt int64, previous string, metadata map[string]any) map[string]any {

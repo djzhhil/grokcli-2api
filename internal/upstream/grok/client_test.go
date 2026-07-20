@@ -90,6 +90,44 @@ func TestOpenUsesResponsesPathAndBridgesChatChunks(t *testing.T) {
 	}
 }
 
+func TestOpenUsesResponsesPathAndBridgesCompletedOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("path=%s want /v1/responses", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		frames := []string{
+			`event: response.created` + "\n" + `data: {"type":"response.created","response":{"id":"resp_1","model":"grok-4.5-build-free","created_at":1700000000}}` + "\n\n",
+			`event: response.completed` + "\n" + `data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4.5-build-free","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final-only"}]}],"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}}}` + "\n\n",
+		}
+		for _, frame := range frames {
+			_, _ = w.Write([]byte(frame))
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL + "/v1", HTTP: server.Client()}
+	response, err := client.Open(context.Background(), Account{ID: "a", Token: "token"}, "grok-4.5", map[string]any{
+		"stream":   false,
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, `"content":"final-only"`) {
+		t.Fatalf("missing completed output bridge: %s", text)
+	}
+	if !strings.Contains(text, "data: [DONE]") {
+		t.Fatalf("missing DONE: %s", text)
+	}
+}
+
 func TestChatToResponsesPayloadConvertsTools(t *testing.T) {
 	body := chatToResponsesPayload(map[string]any{
 		"messages": []any{

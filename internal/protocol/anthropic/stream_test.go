@@ -648,7 +648,6 @@ func TestForceFinishEmitsCoercedEdit(t *testing.T) {
 	}
 }
 
-
 func TestRequeueUnacksTerminalWhenToolsRetry(t *testing.T) {
 	a := NewStreamAssembler("msg_rq", "grok", true, 2, []string{"Read"})
 	_ = a.Start(1)
@@ -758,7 +757,6 @@ func TestStreamAssemblerClientDeliveryOK(t *testing.T) {
 	}
 }
 
-
 func TestAnthropicRequeueUnacksTerminal(t *testing.T) {
 	a := NewStreamAssembler("msg_u", "m", true, 2, []string{"Read"})
 	_ = a.Start(1)
@@ -809,7 +807,6 @@ func TestAnthropicRequeueUnacksTerminal(t *testing.T) {
 		t.Fatalf("tool_use must precede message_stop")
 	}
 }
-
 
 func TestAnthropicRequeueUnacksTerminalWhenToolsNeedRetry(t *testing.T) {
 	a := NewStreamAssembler("msg_requeue", "grok", true, 2, []string{"Read"})
@@ -867,5 +864,37 @@ func TestAnthropicClientDeliveryOK(t *testing.T) {
 	a.AckTerminal()
 	if !a.ClientDeliveryOK() {
 		t.Fatal("text + acked terminal must be OK")
+	}
+}
+
+// maxTools=1 with two complete tools must not re-emit message_stop in a loop.
+func TestMaxToolsCapDoesNotLoopMessageStop(t *testing.T) {
+	s := NewStreamAssembler("msg_cap", "grok", true, 1, []string{"Read", "Write"})
+	frames := s.Feed("", "", []ToolDelta{
+		{Index: 0, ID: "c1", Name: "Read", Arguments: `{"file_path":"/a.txt"}`},
+		{Index: 1, ID: "c2", Name: "Read", Arguments: `{"file_path":"/b.txt"}`},
+	})
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, "tool_use") {
+		// may need Start first
+		start := s.Start(0)
+		frames = append(start, frames...)
+		joined = strings.Join(frames, "")
+	}
+	if s.HasPendingTools() {
+		t.Fatal("capped excess tools must not look pending")
+	}
+	if s.hasReadyUnemittedTools() {
+		t.Fatal("capped excess tools must not look ready-to-emit")
+	}
+	// Force finish
+	fin := s.Finish("tool_use", Usage{})
+	finJoined := strings.Join(fin, "")
+	// Ack everything we can
+	s.AckMessageStart()
+	s.AckToolsInPayload(joined + finJoined)
+	s.AckTerminal()
+	if s.NeedsFinishRetry() {
+		t.Fatal("after cap+ack, NeedsFinishRetry must be false")
 	}
 }

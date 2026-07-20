@@ -502,11 +502,13 @@ func TestAdminAndStaticFiles(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, "favicon.ico"), "ico")
 	mustWrite(t, filepath.Join(dir, "admin", "index.html"), "admin")
 	mustWrite(t, filepath.Join(dir, "admin", "keys.html"), "keys")
+	mustWrite(t, filepath.Join(dir, "admin", "usage.html"), "usage-page")
+	mustWrite(t, filepath.Join(dir, "admin", "logs.html"), "logs-page")
 	mustWrite(t, filepath.Join(dir, "js", "app.js"), "console.log(1)")
 
 	handler := NewMux(Options{Ready: func() bool { return true }, StaticDir: dir})
 
-	for _, path := range []string{"/", "/favicon.ico", "/admin", "/admin/keys", "/static/js/app.js"} {
+	for _, path := range []string{"/", "/favicon.ico", "/admin", "/admin/keys", "/admin/usage", "/admin/logs", "/static/js/app.js"} {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 		if recorder.Code != http.StatusOK {
@@ -514,16 +516,35 @@ func TestAdminAndStaticFiles(t *testing.T) {
 		}
 	}
 
+	// overview alias must serve index.html (not 404 looking for overview.html).
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/overview", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "admin" {
+		t.Fatalf("/admin/overview status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/usage", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "usage-page" {
+		t.Fatalf("/admin/usage status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
 	if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
 		t.Fatalf("admin cache-control = %q", got)
 	}
 
 	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/nope", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("/admin/nope status = %d", recorder.Code)
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
+	if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("admin cache-control = %q", got)
+	}
+
+	// Mobile nav regression: missing PAGE_HREF entry produced href="undefined".
+	for _, bad := range []string{"/admin/undefined", "/admin/null", "/admin/nope"} {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, bad, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d want 404", bad, recorder.Code)
+		}
 	}
 }
 
@@ -786,7 +807,13 @@ func (s *shortWriteToolRecorder) Write(p []byte) (int, error) {
 		if half < 1 {
 			half = 1
 		}
-		// Do NOT write to underlying body (client never saw full group).
+		// Real short-write semantics: first half is accepted by the peer.
+		// (Returning n without Write left the body missing content_block_start
+		// while the resumable path continued with only the tail.)
+		n, err := s.ResponseRecorder.Write(p[:half])
+		if err != nil {
+			return n, err
+		}
 		return half, nil
 	}
 	return s.ResponseRecorder.Write(p)
@@ -1631,5 +1658,214 @@ func TestStreamAnthropicClientGoneIncompleteToolFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "empty model output") && !strings.Contains(err.Error(), "no content/tool_calls") {
 		t.Fatalf("expected empty-output error, got %v body=%q", err, recorder.Body.String())
+	}
+}
+
+func TestResponsesSoftCloseWhenToolAckedTerminalMissing(t *testing.T) {
+	// Regression: tool was fully written+Ack'd but response.completed soft-failed /
+	// never Ack'd. Must soft-close (nil err) instead of Fail("empty model output")
+	// which Claude Code reports as intermittent "Tool use interrupted".
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	sse := "" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"/a.go\\\"}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	body := strings.NewReader(sse)
+	fw := &failOnCompletedWriter{ResponseRecorder: recorder}
+	_, _, err := streamOpenAIResponses(fw, req, body, "resp_soft", "grok-4.5", []string{"Read"}, 20*time.Millisecond, 1)
+	out := recorder.Body.String()
+	if !strings.Contains(out, "function_call") {
+		t.Fatalf("expected function_call in body, got %q", out)
+	}
+	if err != nil && strings.Contains(err.Error(), "empty model output") {
+		t.Fatalf("must soft-close after acked tool (not empty fail): err=%v body=%q", err, out)
+	}
+	if strings.Contains(out, "empty model output") {
+		t.Fatalf("must not Fail empty over delivered tool: body=%q", out)
+	}
+}
+
+// failOnCompletedWriter soft-fails only response.completed / pure [DONE] writes.
+type failOnCompletedWriter struct {
+	*httptest.ResponseRecorder
+	flushed int
+}
+
+func (f *failOnCompletedWriter) Flush() { f.flushed++ }
+
+func (f *failOnCompletedWriter) Write(p []byte) (int, error) {
+	s := string(p)
+	if strings.Contains(s, "response.completed") {
+		return 0, errors.New("broken pipe")
+	}
+	// Terminal [DONE] only (not mixed with function_call payload).
+	if strings.Contains(s, "[DONE]") && !strings.Contains(s, "function_call") && !strings.Contains(s, "output_text") && !strings.Contains(s, "reasoning") {
+		return 0, errors.New("broken pipe")
+	}
+	return f.ResponseRecorder.Write(p)
+}
+
+// Soft-fail during text coalesce must not drop buffered text_delta frames.
+// Regression: flushPendingSSE used to clear pendingSSE before LastOK, so a single
+// connection-reset blip truncated assistant text mid-turn (Claude Code incomplete output).
+func TestAnthropicTextCoalesceSurvivesSoftWriteBlip(t *testing.T) {
+	soft := &softFailRecorder{ResponseRecorder: httptest.NewRecorder(), failWrites: 1, failAny: true}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	var b strings.Builder
+	// First token lands immediately (TTFT); subsequent tiny deltas coalesce.
+	b.WriteString(`data: {"choices":[{"delta":{"content":"Hello"}}]}` + "\n\n")
+	for i := 0; i < 20; i++ {
+		b.WriteString(`data: {"choices":[{"delta":{"content":" world"}}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":10,"total_tokens":11}}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+	_, _, err := streamAnthropicMessages(soft, req, strings.NewReader(b.String()), "msg_text_soft", "grok", false, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := soft.Body.String()
+	if !strings.Contains(out, "Hello") {
+		t.Fatalf("missing first text, body=%q", out[:min(400, len(out))])
+	}
+	// Coalesced " world" repeats must survive the soft blip (not permanently dropped).
+	if n := strings.Count(out, " world"); n < 10 {
+		t.Fatalf("coalesced text lost after soft write: world_count=%d bodyLen=%d softGone_writes=%d", n, len(out), soft.writes)
+	}
+	if !strings.Contains(out, "message_stop") {
+		t.Fatalf("missing message_stop after soft text blip, body=%q", out[:min(300, len(out))])
+	}
+}
+
+// Responses path: soft-fail mid-coalesce must still deliver full output_text.
+func TestResponsesTextCoalesceSurvivesSoftWriteBlip(t *testing.T) {
+	soft := &softFailRecorder{ResponseRecorder: httptest.NewRecorder(), failWrites: 1, failAny: true}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	var b strings.Builder
+	b.WriteString(`data: {"choices":[{"delta":{"content":"Alpha"}}]}` + "\n\n")
+	for i := 0; i < 20; i++ {
+		b.WriteString(`data: {"choices":[{"delta":{"content":"Beta"}}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":10,"total_tokens":11}}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+	_, _, err := streamOpenAIResponses(soft, req, strings.NewReader(b.String()), "resp_text_soft", "grok", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := soft.Body.String()
+	if !strings.Contains(out, "Alpha") {
+		t.Fatalf("missing first text, body=%q", out[:min(400, len(out))])
+	}
+	if n := strings.Count(out, "Beta"); n < 10 {
+		t.Fatalf("coalesced text lost after soft write: beta_count=%d bodyLen=%d", n, len(out))
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Fatalf("missing response.completed, body=%q", out[:min(300, len(out))])
+	}
+}
+
+// Soft short-write mid text coalesce must not leave the client with truncated
+// assistant text. The unsent tail stays buffered and is force-drained before
+// message_stop (Finish does not re-emit lost text_delta frames).
+func TestStreamAnthropicTextSoftShortWriteNotTruncated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	var b strings.Builder
+	// First delta flushes immediately (TTFT); subsequent ones coalesce.
+	b.WriteString(`data: {"choices":[{"delta":{"content":"START-"}}]}` + "\n\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString(`data: {"choices":[{"delta":{"content":"chunk"}}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"choices":[{"delta":{"content":"-END"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":10,"total_tokens":11}}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+
+	rec := &softFailRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		failWrites:       1,
+		failMatch:        "text_delta",
+		shortWrite:       true,
+	}
+	_, _, err := streamAnthropicMessages(rec, req, strings.NewReader(b.String()), "msg_text_soft_sw", "grok", false, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "START-") {
+		t.Fatalf("missing START- in body (len=%d): %s", len(out), out[:min(500, len(out))])
+	}
+	if !strings.Contains(out, "-END") {
+		t.Fatalf("missing -END (truncated text on soft short-write), body tail: %s", out[max(0, len(out)-800):])
+	}
+	if n := strings.Count(out, "chunk"); n < 30 {
+		t.Fatalf("expected ~40 chunk deltas, got raw chunk count=%d (truncated?)", n)
+	}
+	if !strings.Contains(out, "message_stop") {
+		t.Fatalf("missing message_stop after soft short-write recovery")
+	}
+}
+
+// Chat completions path: soft short-write of coalesced pure text must re-buffer
+// the unsent tail and drain it before [DONE] (not drop mid-turn content).
+func TestStreamChatTextSoftShortWriteNotTruncated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	var b strings.Builder
+	b.WriteString(`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"HELLO-"}}]}` + "\n\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString(`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"xx"}}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"-BYE"},"finish_reason":"stop"}]}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+
+	rec := &softFailRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		failWrites:       1,
+		failMatch:        `"content":"xx"`,
+		shortWrite:       true,
+	}
+	_, err := streamChatCompletions(rec, req, strings.NewReader(b.String()), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "HELLO-") {
+		t.Fatalf("missing HELLO-: %s", out[:min(400, len(out))])
+	}
+	if !strings.Contains(out, "-BYE") {
+		t.Fatalf("missing -BYE after soft short-write (truncated): tail=%s", out[max(0, len(out)-500):])
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatal("missing [DONE]")
+	}
+}
+
+// Responses path: soft short-write of coalesced text must not drop mid-turn output.
+func TestStreamOpenAIResponsesTextSoftShortWriteNotTruncated(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	var b strings.Builder
+	b.WriteString(`data: {"choices":[{"delta":{"content":"ALPHA-"}}]}` + "\n\n")
+	for i := 0; i < 30; i++ {
+		b.WriteString(`data: {"choices":[{"delta":{"content":"yy"}}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"choices":[{"delta":{"content":"-OMEGA"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":8,"total_tokens":10}}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+
+	rec := &softFailRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		failWrites:       1,
+		failMatch:        "output_text",
+		shortWrite:       true,
+	}
+	_, _, err := streamOpenAIResponses(rec, req, strings.NewReader(b.String()), "resp_text_soft_sw", "grok", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "ALPHA-") {
+		t.Fatalf("missing ALPHA-: %s", out[:min(400, len(out))])
+	}
+	if !strings.Contains(out, "-OMEGA") {
+		t.Fatalf("missing -OMEGA (truncated text): tail=%s", out[max(0, len(out)-600):])
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Fatal("missing response.completed")
 	}
 }

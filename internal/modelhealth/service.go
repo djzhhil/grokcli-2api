@@ -22,19 +22,21 @@ import (
 
 // Default probe knobs mirror Python grok2api.pool.model_health.
 const (
-	defaultWorkers            = 8
-	defaultBatch              = 50
+	// Large-pool defaults: ~7k accounts / batch 120 / interval 180s ≈ ~3h full sweep.
+	// Override via GROK2API_MODEL_PROBE_BATCH / WORKERS / MODEL_HEALTH_INTERVAL.
+	defaultWorkers            = 12
+	defaultBatch              = 120
 	defaultMaxModelsPerAcct   = 2
 	defaultCycleBudget        = 150 * time.Second
 	defaultManualCycleBudget  = 150 * time.Second
-	defaultProbeTimeout       = 15 * time.Second
+	defaultProbeTimeout       = 12 * time.Second
 	defaultManualAccountLimit = 5000
 	// Multi-wave manual_all: keep each wave short (lock-friendly) but continue
 	// until the live pool is covered or maxWaves is hit.
-	defaultManualMaxWaves   = 40
+	defaultManualMaxWaves   = 80
 	defaultManualWaveBudget = 90 * time.Second
 	// Full-job wall clock for async probe-all (multi-wave).
-	defaultManualJobTimeout = 30 * time.Minute
+	defaultManualJobTimeout = 45 * time.Minute
 	defaultSweepTTLSec      = 12 * 3600
 )
 
@@ -84,13 +86,14 @@ func New(store *postgres.Connector, redisClient *redis.Client, upstream string, 
 		models = []string{"grok-4.5"}
 	}
 	return &Service{
-		Store:               store,
-		Redis:               redisClient,
-		Upstream:            strings.TrimRight(upstream, "/"),
-		Models:              models,
-		Interval:            envDurationSec("GROK2API_MODEL_HEALTH_INTERVAL", 15*time.Minute, 30*time.Second, 2*time.Hour),
-		Batch:               envInt("GROK2API_MODEL_PROBE_BATCH", defaultBatch, 1, 500),
-		Workers:             envInt("GROK2API_MODEL_PROBE_WORKERS", defaultWorkers, 1, 32),
+		Store:    store,
+		Redis:    redisClient,
+		Upstream: strings.TrimRight(upstream, "/"),
+		Models:   models,
+		// Default interval 3m (was 15m) so large pools finish a sweep in hours, not days.
+		Interval:            envDurationSec("GROK2API_MODEL_HEALTH_INTERVAL", 3*time.Minute, 30*time.Second, 2*time.Hour),
+		Batch:               envInt("GROK2API_MODEL_PROBE_BATCH", defaultBatch, 1, 1000),
+		Workers:             envInt("GROK2API_MODEL_PROBE_WORKERS", defaultWorkers, 1, 64),
 		MaxModelsPerAccount: envInt("GROK2API_MODEL_PROBE_MAX_MODELS_PER_ACCOUNT", defaultMaxModelsPerAcct, 1, 16),
 		CycleBudget:         envDurationSec("GROK2API_MODEL_PROBE_CYCLE_BUDGET", defaultCycleBudget, 15*time.Second, 4*time.Minute),
 		ManualCycleBudget:   envDurationSec("GROK2API_MODEL_PROBE_MANUAL_BUDGET", defaultManualCycleBudget, 30*time.Second, 4*time.Minute),
@@ -105,6 +108,45 @@ func New(store *postgres.Connector, redisClient *redis.Client, upstream string, 
 		job:                 map[string]any{"running": false},
 		localSweepCovered:   map[string]struct{}{},
 	}
+}
+
+// Configure hot-applies knobs from durable settings / admin without restart.
+// Zero / negative values leave the current field unchanged.
+func (s *Service) Configure(intervalSec float64, batch, workers int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if intervalSec >= 30 {
+		d := time.Duration(intervalSec * float64(time.Second))
+		if d > 2*time.Hour {
+			d = 2 * time.Hour
+		}
+		s.Interval = d
+	}
+	if batch >= 1 {
+		if batch > 1000 {
+			batch = 1000
+		}
+		s.Batch = batch
+	}
+	if workers >= 1 {
+		if workers > 64 {
+			workers = 64
+		}
+		s.Workers = workers
+	}
+}
+
+// Knobs returns current interval/batch/workers for admin UI.
+func (s *Service) Knobs() (interval time.Duration, batch, workers int) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Interval, s.Batch, s.Workers
 }
 
 func newProbeHTTPClient() *http.Client {
@@ -240,7 +282,22 @@ func (s *Service) Status() map[string]any {
 	out["job"] = jobCopy
 	if s.Store != nil && batch > 0 && interval > 0 {
 		if n, err := s.Store.CountEnabledAccounts(context.Background()); err == nil && n > 0 {
-			cycles := (int(n) + batch - 1) / batch
+			// Match runWave adaptive batch so ETA is not wildly pessimistic.
+			effBatch := batch
+			if workers > 0 {
+				adaptive := workers * 15
+				if adaptive > effBatch {
+					effBatch = adaptive
+				}
+				if effBatch > 400 {
+					effBatch = 400
+				}
+			}
+			if effBatch < 1 {
+				effBatch = 1
+			}
+			out["probe_batch_effective"] = effBatch
+			cycles := (int(n) + effBatch - 1) / effBatch
 			out["full_pool_eta_sec"] = float64(cycles) * interval.Seconds()
 			covered, gen, mode := s.sweepSnapshot(int(n))
 			remaining := int(n) - covered
@@ -286,6 +343,14 @@ func (s *Service) maybeRun() {
 	if s.IsLeader != nil && !s.IsLeader() {
 		return
 	}
+	// Never race background waves against admin "全部模型探测" (shared lock + sweep).
+	s.jobMu.Lock()
+	manualBusy := s.jobRunning
+	s.jobMu.Unlock()
+	if manualBusy {
+		slog.Debug("model health background skipped: manual_all running")
+		return
+	}
 	// Background cycles stay inside the maintenance lock budget (~3 min).
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -302,7 +367,7 @@ func (s *Service) RunOnce(ctx context.Context, source string) map[string]any {
 	if source == "manual_all" || source == "manual" || source == "admin" {
 		return s.runManualAll(ctx, source)
 	}
-	return s.runWave(ctx, source, false)
+	return s.runWave(ctx, source, false, false)
 }
 
 // StartProbeAll starts (or returns) an async full-pool probe job.
@@ -333,6 +398,10 @@ func (s *Service) StartProbeAll() map[string]any {
 	}
 	jobSnap := cloneMap(s.job)
 	s.jobMu.Unlock()
+
+	// Fresh sweep generation for this manual job so we do not inherit a half-covered
+	// background generation (which made "全部模型探测" look stuck / incomplete).
+	_ = s.startSweep(context.Background())
 
 	go func() {
 		result := s.runManualAll(ctx, "manual_all")
@@ -373,6 +442,28 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 		return result
 	}
 
+	// Hold model_health lock for the whole multi-wave job so background waves
+	// cannot sneak between waves (intermittent deferred_busy → 0/0).
+	skipWaveLock := false
+	if s.Redis != nil && s.Redis.Enabled() {
+		lockTTL := 5 * time.Minute
+		lockCtx, lockCancel := context.WithTimeout(ctx, 3*time.Minute)
+		ok, release, err := s.Redis.AcquireMaintenanceLock(lockCtx, "model_health", lockTTL, true)
+		lockCancel()
+		if err == nil && ok {
+			defer release()
+			skipWaveLock = true
+			result["job_lock"] = true
+		} else if err == nil && !ok {
+			slog.Warn("model health manual_all: job lock busy; per-wave locks will be used")
+			result["job_lock"] = false
+			result["job_lock_busy"] = true
+		} else if err != nil {
+			slog.Warn("model health manual_all: job lock error", "error", err)
+			result["lock_error"] = err.Error()
+		}
+	}
+
 	maxWaves := s.ManualMaxWaves
 	if maxWaves <= 0 {
 		maxWaves = defaultManualMaxWaves
@@ -397,6 +488,8 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 	var lastWorkers int
 	waves := 0
 	budgetHitFinal := false
+	busySkips := 0
+	emptySkips := 0
 
 	for wave := 1; wave <= maxWaves; wave++ {
 		if ctx.Err() != nil {
@@ -405,23 +498,19 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 		}
 		// Per-wave context with its own budget; parent cancel still stops the job.
 		waveCtx, cancel := context.WithTimeout(ctx, waveBudget+30*time.Second)
-		waveRes := s.runWave(waveCtx, source, true)
+		waveRes := s.runWave(waveCtx, source, true, skipWaveLock)
 		cancel()
 		waves = wave
 
-		probed, _ := waveRes["probed"].(int)
-		count, _ := waveRes["count"].(int)
-		avail, _ := waveRes["available_count"].(int)
+		probed := intOf(waveRes["probed"])
+		count := intOf(waveRes["count"])
+		avail := intOf(waveRes["available_count"])
 		if avail == 0 {
-			if v, ok := waveRes["available"].(int); ok {
-				avail = v
-			}
+			avail = intOf(waveRes["available"])
 		}
-		failed, _ := waveRes["unavailable_count"].(int)
+		failed := intOf(waveRes["unavailable_count"])
 		if failed == 0 {
-			if v, ok := waveRes["failed"].(int); ok {
-				failed = v
-			}
+			failed = intOf(waveRes["failed"])
 		}
 		totalAccounts += probed
 		totalProbes += count
@@ -462,25 +551,96 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 			if sw, ok := waveRes["sweep"].(map[string]any); ok {
 				s.job["sweep"] = sw
 			}
+			if m, ok := waveRes["models"].([]string); ok && len(m) > 0 {
+				s.job["models"] = m
+			}
+			if w := intOf(waveRes["workers"]); w > 0 {
+				s.job["workers"] = w
+			}
 		}
 		s.jobMu.Unlock()
 
+		// Lock-busy waves return no useful sweep remaining. Handle deferred_busy
+		// BEFORE the "empty pool" exit, otherwise intermittent 0/0 happens whenever
+		// background health still holds the model_health lock for a few seconds.
+		if waveRes["deferred_busy"] == true {
+			result["deferred_busy"] = true
+			busySkips++
+			if waveRes["error"] != nil {
+				result["error"] = waveRes["error"]
+			}
+			s.jobMu.Lock()
+			if s.jobRunning {
+				s.job["wave"] = wave
+				s.job["waves"] = wave
+				s.job["running"] = true
+				s.job["deferred_busy"] = true
+				s.job["busy_skips"] = busySkips
+				s.job["elapsed_ms"] = time.Since(startedAt).Milliseconds()
+				if sw, ok := waveRes["sweep"].(map[string]any); ok {
+					s.job["sweep"] = sw
+				}
+			}
+			s.jobMu.Unlock()
+			if wave < maxWaves && ctx.Err() == nil {
+				// Background waves hold the lock up to ~cycle budget; wait longer than
+				// 2s so we actually get a turn instead of spinning 80×2s fails.
+				wait := 5 * time.Second
+				if busySkips > 3 {
+					wait = 15 * time.Second
+				}
+				if busySkips > 8 {
+					wait = 30 * time.Second
+				}
+				select {
+				case <-ctx.Done():
+					budgetHitFinal = true
+				case <-time.After(wait):
+				}
+				if ctx.Err() == nil {
+					continue
+				}
+			}
+			break
+		}
+
 		// Stop when nothing left to probe this generation.
 		remaining := intOfMap(waveRes, "sweep", "remaining")
+		// Busy/empty paths may omit remaining; recompute from probeable set.
+		if waveRes["sweep"] == nil {
+			live := 0
+			if s.Store != nil {
+				if n, err := s.Store.CountProbeableAccounts(ctx); err == nil {
+					live = int(n)
+				}
+			}
+			covered, _, _ := s.sweepSnapshot(live)
+			remaining = live - covered
+			if remaining < 0 {
+				remaining = 0
+			}
+		}
 		if remaining == 0 && probed == 0 {
-			// empty pool
+			// Truly empty / fully covered — not a lock miss.
 			break
 		}
 		if remaining == 0 {
 			budgetHitFinal = false
 			break
 		}
-		// If this wave probed nothing useful (lock busy / empty), stop to avoid spin.
-		if waveRes["deferred_busy"] == true {
-			result["deferred_busy"] = true
-			break
-		}
+		// probed==0 with remaining>0: soft-continue (SQL exclude should avoid this).
 		if probed == 0 {
+			emptySkips++
+			if remaining > 0 && wave < maxWaves {
+				select {
+				case <-ctx.Done():
+					budgetHitFinal = true
+				case <-time.After(500 * time.Millisecond):
+				}
+				if ctx.Err() == nil {
+					continue
+				}
+			}
 			break
 		}
 	}
@@ -508,11 +668,36 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 	result["workers"] = lastWorkers
 	result["waves"] = waves
 	result["budget_hit"] = budgetHitFinal
+	result["busy_skips"] = busySkips
+	result["empty_skips"] = emptySkips
 	result["elapsed_ms"] = time.Since(startedAt).Milliseconds()
-	// Attach current sweep snapshot.
+	if totalAccounts == 0 {
+		if result["error"] == nil || result["error"] == "" {
+			if result["deferred_busy"] == true {
+				result["error"] = "model_health lock busy — no wave completed"
+				result["ok"] = false
+			} else {
+				result["error"] = "no probeable accounts (all cooling, expired, disabled, or missing token)"
+			}
+		}
+	}
+	// Surface empty runs so admin UI does not show a silent "0/0 可用" as success.
+	if totalAccounts == 0 && totalProbes == 0 {
+		result["ok"] = false
+		if result["error"] == nil {
+			if result["deferred_busy"] == true {
+				result["error"] = "no accounts probed: model_health lock busy"
+			} else {
+				result["error"] = "no probeable accounts (all cooling / disabled / expired / missing token?)"
+			}
+		}
+	}
+	// Attach current sweep snapshot (probeable set, not all enabled).
 	live := 0
 	if s.Store != nil {
-		if n, err := s.Store.CountEnabledAccounts(ctx); err == nil {
+		if n, err := s.Store.CountProbeableAccounts(ctx); err == nil {
+			live = int(n)
+		} else if n, err := s.Store.CountEnabledAccounts(ctx); err == nil {
 			live = int(n)
 		}
 	}
@@ -544,7 +729,7 @@ func (s *Service) runManualAll(ctx context.Context, source string) map[string]an
 }
 
 // runWave performs one locked probe wave (background batch or one manual wave).
-func (s *Service) runWave(ctx context.Context, source string, manualWave bool) map[string]any {
+func (s *Service) runWave(ctx context.Context, source string, manualWave bool, skipLock bool) map[string]any {
 	startedAt := time.Now()
 	result := map[string]any{"ok": true, "source": source, "implementation": "go", "at": startedAt.Unix()}
 	if s.Store == nil {
@@ -552,15 +737,65 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool) m
 		result["error"] = "store unavailable"
 		return result
 	}
-	if s.Redis != nil && s.Redis.Enabled() {
-		// Lock TTL must cover the wave; renew loop inside AcquireMaintenanceLock.
+	// Background must yield to in-flight manual_all (shared sweep + lock).
+	if !manualWave {
+		s.jobMu.Lock()
+		busy := s.jobRunning
+		s.jobMu.Unlock()
+		if busy {
+			result["deferred_busy"] = true
+			result["error"] = "manual_all running — background wave deferred"
+			return result
+		}
+	}
+	if !skipLock && s.Redis != nil && s.Redis.Enabled() {
+		// Per-owner lock (model_health). Token maintainer uses a different key.
+		// Manual_all waits longer for the lock so a concurrent background wave
+		// (cycle budget ~2m) does not turn the whole job into intermittent 0/0.
 		lockTTL := 180 * time.Second
-		ok, release, err := s.Redis.AcquireMaintenanceLock(ctx, "model_health", lockTTL, true)
+		wait := lockTTL
+		if manualWave {
+			// Blocking wait up to one full background cycle + headroom.
+			wait = 3 * time.Minute
+			if wait < lockTTL {
+				wait = lockTTL
+			}
+		}
+		// Temporarily extend ctx wait for lock only when parent allows.
+		lockCtx := ctx
+		var lockCancel context.CancelFunc
+		if manualWave {
+			lockCtx, lockCancel = context.WithTimeout(ctx, wait)
+		}
+		ok, release, err := s.Redis.AcquireMaintenanceLock(lockCtx, "model_health", lockTTL, true)
+		if lockCancel != nil {
+			lockCancel()
+		}
 		if err == nil && ok {
 			defer release()
 		} else if err == nil && !ok {
 			result["deferred_busy"] = true
+			result["error"] = "model_health lock busy — concurrent probe wave still holding the slot"
+			// Attach live sweep so callers do not treat remaining as 0/empty pool.
+			liveN := 0
+			if n, err2 := s.Store.CountProbeableAccounts(ctx); err2 == nil {
+				liveN = int(n)
+			}
+			covered, gen, mode := s.sweepSnapshot(liveN)
+			rem := liveN - covered
+			if rem < 0 {
+				rem = 0
+			}
+			result["sweep"] = map[string]any{
+				"mode": mode, "live": liveN, "covered": covered, "remaining": rem, "generation": gen,
+			}
+			result["probed"] = 0
+			result["count"] = 0
 			return result
+		} else if err != nil {
+			// Redis blip: continue without lock rather than aborting with 0/0.
+			slog.Warn("model health lock acquire failed; continuing without lock", "error", err, "manual", manualWave)
+			result["lock_error"] = err.Error()
 		}
 	}
 
@@ -568,12 +803,37 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool) m
 	if batch <= 0 {
 		batch = defaultBatch
 	}
+	workersHint := s.Workers
+	if workersHint <= 0 {
+		workersHint = defaultWorkers
+	}
+	// Adaptive background batch: aim for ~workers*12–20 accounts/wave so a 7k
+	// pool is not stuck at batch=20 for days. Cap keeps cycle budget honest.
+	if !manualWave {
+		adaptive := workersHint * 15
+		if adaptive < batch {
+			adaptive = batch
+		}
+		if adaptive > 400 {
+			adaptive = 400
+		}
+		if adaptive > batch {
+			batch = adaptive
+		}
+	}
 	// Manual waves still use larger per-wave selection (up to 5000) so one wave
 	// can chew through as many accounts as the budget allows.
 	limit := batch
 	if manualWave {
 		limit = defaultManualAccountLimit
-		if n, err := s.Store.CountEnabledAccounts(ctx); err == nil && n > 0 {
+		if n, err := s.Store.CountProbeableAccounts(ctx); err == nil && n > 0 {
+			if int(n) < limit {
+				limit = int(n)
+			}
+			if limit < batch {
+				limit = batch
+			}
+		} else if n, err := s.Store.CountEnabledAccounts(ctx); err == nil && n > 0 {
 			if int(n) < limit {
 				limit = int(n)
 			}
@@ -584,18 +844,44 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool) m
 	}
 
 	// Over-fetch then filter by sweep covered set so we fill the batch with uncovered.
+	// Prefer CountProbeableAccounts so remaining matches ListAccountAuthsForProbe
+	// eligibility (sticky cool with expired until is still probeable; quota_disabled is not).
+	liveN := 0
+	if n, err := s.Store.CountProbeableAccounts(ctx); err == nil {
+		liveN = int(n)
+	} else if n, err := s.Store.CountEnabledAccounts(ctx); err == nil {
+		liveN = int(n)
+	}
+	// Already-covered IDs (this generation) — pass to SQL so multi-wave does not
+	// re-fetch the same priority top-N every wave (was probed=0 → early stop).
+	stPre := s.loadSweep(ctx)
+	excludeIDs := make([]string, 0, len(stPre.Covered))
+	for id := range stPre.Covered {
+		excludeIDs = append(excludeIDs, id)
+	}
 	fetchLimit := limit
 	if !manualWave {
 		// Background: fetch more candidates so covered filtering still fills Batch.
 		fetchLimit = batch * 4
-		if fetchLimit < 100 {
-			fetchLimit = 100
+		if fetchLimit < 200 {
+			fetchLimit = 200
 		}
-		if fetchLimit > 2000 {
-			fetchLimit = 2000
+		if fetchLimit > 4000 {
+			fetchLimit = 4000
+		}
+	} else {
+		if fetchLimit < limit {
+			fetchLimit = limit
+		}
+		if fetchLimit > 5000 {
+			fetchLimit = 5000
 		}
 	}
-	auths, err := s.Store.ListAccountAuthsForProbe(ctx, fetchLimit)
+	auths, err := s.Store.ListAccountAuthsForProbe(ctx, fetchLimit, excludeIDs...)
+	if err != nil {
+		// Fallback without exclude if ANY() fails for any reason.
+		auths, err = s.Store.ListAccountAuthsForProbe(ctx, fetchLimit)
+	}
 	if err != nil {
 		auths, err = s.Store.ListAccountAuths(ctx, fetchLimit, true)
 	}
@@ -607,10 +893,6 @@ func (s *Service) runWave(ctx context.Context, source string, manualWave bool) m
 
 	// Strict non-repeat sweep for background; manual_all also marks covered so
 	// multi-wave does not re-probe the same accounts within the job.
-	liveN := 0
-	if n, err := s.Store.CountEnabledAccounts(ctx); err == nil {
-		liveN = int(n)
-	}
 	sweepInfo, uncovered := s.filterUncovered(ctx, auths, liveN, source)
 	if len(uncovered) > limit {
 		uncovered = uncovered[:limit]
@@ -868,6 +1150,12 @@ func (s *Service) probeAccountsConcurrent(ctx context.Context, auths []postgres.
 				}
 			}
 		}
+		// Ensure free-usage / 429 fails always enter cooldown even if Kick was skipped.
+		if n, err := s.Store.RepairFreeUsageModelBlocks(ctx); err != nil {
+			slog.Warn("model health cooldown repair failed", "error", err)
+		} else if n > 0 {
+			slog.Info("model health cooldown repair applied", "accounts", n)
+		}
 	}
 	return out
 }
@@ -1055,7 +1343,9 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 				results[i] = map[string]any{"ok": false, "account_id": r.id, "error": r.err.Error()}
 				continue
 			}
-			probe := s.probeAccount(ctx, *r.auth, probeModel, source, autoDisable, false)
+			// deferSave=true: return probe results first; last_probe flushed async below.
+			// Kick/Clear/Block still apply immediately during probe.
+			probe := s.probeAccount(ctx, *r.auth, probeModel, source, autoDisable, true)
 			ok := probe["available"] == true
 			results[i] = map[string]any{"ok": ok, "account_id": r.auth.ID, "email": r.auth.Email, "result": probe}
 		}
@@ -1070,6 +1360,31 @@ func (s *Service) ProbeIDs(ctx context.Context, ids []string, model string, auto
 	}
 	close(jobs)
 	wg.Wait()
+
+	// Flush deferred last_probe after probes complete so admin HTTP can return
+	// live results without waiting on per-row PG writes first.
+	if s.Store != nil {
+		batch := make([]map[string]any, 0, len(results))
+		for _, row := range results {
+			res, _ := row["result"].(map[string]any)
+			if res == nil || res["budget_cut"] == true {
+				continue
+			}
+			batch = append(batch, res)
+		}
+		if len(batch) > 0 {
+			go func(batch []map[string]any) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if _, err := s.Store.SaveLastProbesBatch(ctx, batch); err != nil {
+					for _, p := range batch {
+						aid, _ := p["account_id"].(string)
+						_ = s.Store.SaveLastProbe(ctx, aid, p)
+					}
+				}
+			}(batch)
+		}
+	}
 
 	kickCooldown, kickDisabled, modelBlocks, available := 0, 0, 0, 0
 	for _, row := range results {

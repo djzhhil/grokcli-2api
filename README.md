@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v2.0.1** · Docker 入口自动 migrate · 空库 schema_migrations 修复 · Go 主进程
+**当前版本：v2.0.2** · 额度落库/测活回池 · 多模态保留 · Hermes/Codex shell · 号池稳定排序 · Go 主进程
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:2.0.1` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:2.0.2` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -72,17 +72,19 @@
 
 ---
 
-## 本版本重点（v2.0.1）
+## 本版本重点（v2.0.2）
 
 | 能力 | 行为 |
 |------|------|
-| **Docker 自动迁移** | `entrypoint` 启动前执行 `grok2api-migrate up`；空库自动建 `schema_migrations` + SQL |
-| **空库 fail-closed 修复** | 不再因 `relation "schema_migrations" does not exist` 卡在 `/ready` 503 |
-| **入口开关** | `GROK2API_AUTO_MIGRATE=0` 可跳过；应用进程仍只校验不改 schema |
-| **继承 v2.0.0** | Go 主进程 · 流式 tool 可靠性 · 管理台/冷却统计对齐 |
+| **额度持久化** | 类型（Free/SuperGrok）+ token/美元用量写入 `account_pool.last_quota`；失败探测 merge 不覆盖；脏 error 壳不落库 |
+| **测活后回池** | 新注册账号测活成功保持 **轮询中**；额度二次探测误报 exhausted 时 `ClearAccountCooldown` |
+| **自动额度刷新** | 降并发、轮询补缺、同账号冷却，避免「Too many open connections」扫库污染 |
+| **多模态保留** | Chat/Anthropic 图片 → Responses `input_image`；历史压缩不把图压成纯文本 |
+| **Hermes / Codex shell** | `terminal` 保留 `command`；Codex shell 仍投影 `cmd` |
+| **号池排序** | 默认按 **加入时间**（`create_time`）稳定排序；排序下拉仅在「全部」可用；修复 `oldest` 被误归一成 `newest` |
+| **继承 v2.0.1** | Docker 入口自动 migrate · `schema_migrations` 空库修复 · Go 主进程 |
 
-
-继承 v1.9.92：CPA 风格 prompt cache · 同会话粘号 · 首字延迟热路径 · 用量明细补齐。
+继承 v2.0.0 / v1.9.92：CPA 风格 prompt cache · 同会话粘号 · 流式 tool 可靠性 · 用量明细补齐。
 
 ---
 
@@ -166,7 +168,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:2.0.1
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.2
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -205,7 +207,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:2.0.1
+    image: ghcr.io/hm2899/grokcli-2api:2.0.2
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -327,9 +329,36 @@ go build -o bin/grok2api ./cmd/grok2api && ./bin/grok2api
 
 ---
 
-## 从旧版（JSON 文件）升级
+## 从 1.x / 旧版升级到 2.0.2
 
-详见 **[docs/UPGRADE.md](./docs/UPGRADE.md)**。
+完整步骤见 **[docs/UPGRADE.md](./docs/UPGRADE.md)**（含 file→hybrid、1.x→2.x、空库恢复）。
+
+### 速览：1.x（Python / hybrid）→ 2.0.2（Go 主进程）
+
+```bash
+# 1) 备份
+docker exec grokcli-2api-postgres pg_dump -U grok2api -d grok2api \
+  > ~/grok2api-backup-$(date +%F-%H%M%S).sql
+cp -a ./data ./data.backup-$(date +%Y%m%d)   # 若仍有 data/*.json
+
+# 2) 拉新镜像（镜像名必须全小写）
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.2
+# compose 里把 image 改成 :2.0.2 或 :latest 后：
+docker compose up -d
+
+# 3) 入口会自动 grok2api-migrate up（可用 GROK2API_AUTO_MIGRATE=0 关闭）
+# 4) 验证
+curl -fsS http://127.0.0.1:3000/health || curl -fsS http://127.0.0.1:40081/health
+# 管理台账号数 / API Key 仍可用；额度与类型刷新后仍应从 DB 回填
+```
+
+| 保留 | 注意 |
+|------|------|
+| PostgreSQL 账号 / Key / 设置 / 冷却 | Redis 热状态可丢（粘性会话会重建） |
+| 已迁移的 `last_quota` 真用量 | 历史 error 壳额度快照会被忽略（显示「未查询」可重查） |
+| 管理台密码哈希 | 浏览器需硬刷新（Ctrl+F5）加载新 `core.*.js` |
+
+### 仅文件后端（`data/auth.json`）→ 2.0.2
 
 ```bash
 # 备份 data/ 后
@@ -347,10 +376,10 @@ docker compose run --rm \
 # or: go run ./cmd/grok2api-migrate up
 ```
 
-迁移内容：`auth.json` / `keys.json` / `settings.json`（含账号池状态）→ PostgreSQL。
+迁移内容：`auth.json` / `keys.json` / `settings.json`（含账号池状态）→ PostgreSQL。  
 不迁移：Redis 热状态、管理台登录会话。
 
-已是 hybrid 时，拉新镜像即可。Docker 入口会先跑 `grok2api-migrate up`（建 `schema_migrations` + 版本化 SQL）；Go 进程本身只校验、不改 schema。可用 `GROK2API_AUTO_MIGRATE=0` 关闭入口自动迁移。
+已是 hybrid 时，拉新镜像即可。Docker 入口会先跑 `grok2api-migrate up`；Go 进程本身只校验、不改 schema。可用 `GROK2API_AUTO_MIGRATE=0` 关闭入口自动迁移。
 
 
 ### 已部署库出现 `schema_migrations does not exist` 时
@@ -483,16 +512,18 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) grok2api/app.py 的 APP_VERSION 与 internal/buildinfo.Version 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v2.0.1"
+git add -A && git commit -m "release: v2.0.2"
 git push origin main
-git tag -a v2.0.1 -m "v2.0.1"
-git push origin v2.0.1
-gh release create v2.0.1 --title "v2.0.1 Docker auto-migrate + schema_migrations fix" --notes-file - <<'EOF'
+git tag -a v2.0.2 -m "v2.0.2"
+git push origin v2.0.2
+gh release create v2.0.2 --title "v2.0.2 quota persist · probe re-enter · multimodal · sort" --notes-file - <<'EOF'
 ## Highlights
-- Docker entrypoint 启动前自动执行 `grok2api-migrate up`，修复空库 `schema_migrations does not exist`
-- 保留应用进程 fail-closed 只校验、不改 schema 的合约
-- 可用 `GROK2API_AUTO_MIGRATE=0` 关闭入口自动迁移
-- 文档补充：备份 → migrate → verify → restart 运维恢复步骤
+- 额度类型/用量持久化到 PostgreSQL（last_quota）；失败探测不覆盖真数据
+- 新账号测活成功保持轮询中，不再误进冷却池
+- 多模态图片输入保留（OpenAI / Anthropic → Responses input_image）
+- Hermes terminal 用 command；Codex shell 仍用 cmd
+- 号池按加入时间稳定排序；排序仅在「全部」生效
+- 从 1.x 迁移教程见 README / docs/UPGRADE.md
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -501,7 +532,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:2.0.1
+docker pull ghcr.io/hm2899/grokcli-2api:2.0.2
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -557,7 +588,13 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v2.0.1**（当前）
+- **v2.0.2**（当前）
+  - **额度落库**：`last_quota` 持久化类型 + 用量；失败 merge；禁止 error 壳污染；自动刷新降并发/轮询补缺
+  - **测活回池**：测活成功后不因额度二次探测误进冷却；批量测活同样清冷却
+  - **多模态**：图片 `image_url` / Anthropic base64 → `input_image`；历史压缩保留图块
+  - **Hermes terminal / Codex shell**：`command` vs `cmd` 分端投影
+  - **号池排序**：按加入时间稳定排序；排序仅「全部」可改；修复 `oldest` 归一 bug
+- **v2.0.1**
   - **Docker 入口自动 migrate**：启动前跑 `grok2api-migrate up`，空 Postgres 不再因 `schema_migrations` 缺失 fail-closed
   - 应用进程仍只校验 checksum（`GROK2API_REQUIRE_MIGRATIONS`）；入口可用 `GROK2API_AUTO_MIGRATE=0` 关闭
   - 文档补充备份 → migrate → verify → restart 恢复步骤
@@ -578,8 +615,8 @@ docker-compose.yml                       # redis + postgres（内网）+ app
   - 不完整 tool arguments 不再以 `{"_raw":...}` 下发，避免 Claude Code 判为 malformed
   - **包结构**：业务代码迁入 `grok2api/{admin,pool,protocol,upstream,store}`；根目录与 `store/*` 保留兼容 shim
 - **v1.9.89**
-  - **使用明细 · 思考强度**：管理台「使用明细」直接展示英文标签 low / medium / high / xhigh
-  - 从 OpenAI `reasoning_effort`、Anthropic `thinking`/`budget_tokens`、Responses `reasoning.effort` 提取并写入 usage detail
+  - **使用明细 · 思考强度**：管理台「使用明细」直接展示英文标签 low / medium / high / xhigh / max / ultracode
+  - 从 OpenAI `reasoning_effort`、Anthropic `output_config.effort` / `thinking`/`budget_tokens`、Responses `reasoning.effort` 提取并写入 usage detail（客户端档位完整保留；上游 Grok 折叠为 low|medium|high）
   - 列表接口透出 `reasoning_effort`；点击行可看完整字段
   - 继承 v1.9.87：Token 过期移出轮询 · SSO 续期自愈 · 首页状态统计
 - **v1.9.87**
@@ -702,7 +739,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
   - 已开流时始终发出终态帧（finish/`[DONE]`、`message_delta`/`message_stop`、`response.completed`/`failed`），避免 sub2api/Claude Code 停调度
   - **工具参数加固**：Update 双 JSON 合并取更完整对象；`path`/`oldString` 等别名归一为 Claude Code schema；schema 不完整工具不刷出
   - OpenAI chat 默认不限多工具（`GROK2API_OUTBOUND_MAX_TOOLS_OPENAI=0`）；Claude/sub2api 路径仍默认单工具
-  - xhigh thinking / `budget_tokens` 映射到 `reasoning_effort=xhigh`
+  - Claude Code 档位 low|medium|high|xhigh|max|ultracode：usage 原样记录；上游 Grok 将 xhigh/max/ultracode 折叠为 high
 - **v1.9.63**
   - **注册进度 404 停轮询**：浏览器缓存的过期 `batch_*` / `gba_*` 在后端不存在时清理 track 并停止轮询，避免控制台刷 404
   - 停止按钮对已消失 batch/session 做 not-found 降级
@@ -741,7 +778,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `grok2api/app.py` 的 `APP_VERSION` / `internal/buildinfo.Version` 一致（当前 **2.0.1**）。
+> 镜像 tag 与 `grok2api/app.py` 的 `APP_VERSION` / `internal/buildinfo.Version` 一致（当前 **2.0.2**）。
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -92,6 +93,36 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	}
 	if o.RuntimeConfig != nil {
 		o.RuntimeConfig.ApplyStoreSettings(settings)
+	}
+	// Hot-apply model health knobs (interval/batch/workers) without restart.
+	if o.ModelHealth != nil && settings != nil {
+		var intervalSec float64
+		var batch, workers int
+		switch v := settings["model_health_interval_sec"].(type) {
+		case float64:
+			intervalSec = v
+		case int:
+			intervalSec = float64(v)
+		case int64:
+			intervalSec = float64(v)
+		}
+		switch v := settings["model_health_probe_batch"].(type) {
+		case float64:
+			batch = int(v)
+		case int:
+			batch = v
+		case int64:
+			batch = int(v)
+		}
+		switch v := settings["model_health_probe_workers"].(type) {
+		case float64:
+			workers = int(v)
+		case int:
+			workers = v
+		case int64:
+			workers = int(v)
+		}
+		o.ModelHealth.Configure(intervalSec, batch, workers)
 	}
 	// History compact knobs live in historycompact package (not Config struct).
 	applyHistoryCompactSettings(settings)
@@ -382,6 +413,14 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/register-email/stop", func(w http.ResponseWriter, r *http.Request) {
 		serveRegistrationStopAll(w, r, options)
 	})
+	// Registration SSO cookie export (sessions + durable account fallback).
+	// Missing since Go migration — admin "导出 SSO" hit 404 without these routes.
+	mux.HandleFunc("GET /admin/api/accounts/register-email/export-sso", func(w http.ResponseWriter, r *http.Request) {
+		serveExportRegistrationSSO(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/register-email/export-sso", func(w http.ResponseWriter, r *http.Request) {
+		serveExportRegistrationSSO(w, r, options)
+	})
 	mux.HandleFunc("POST /admin/api/accounts/import-sso", func(w http.ResponseWriter, r *http.Request) {
 		serveSSOImportStart(w, r, options)
 	})
@@ -433,6 +472,9 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("GET /admin/api/model-health", func(w http.ResponseWriter, r *http.Request) {
 		serveModelHealthStatus(w, r, options)
 	})
+	mux.HandleFunc("GET /admin/api/upstream-status", func(w http.ResponseWriter, r *http.Request) {
+		serveUpstreamStatus(w, r, options)
+	})
 	mux.HandleFunc("GET /admin/api/maintainer", func(w http.ResponseWriter, r *http.Request) {
 		serveMaintainerStatus(w, r, options)
 	})
@@ -474,6 +516,12 @@ func NewMux(options Options) http.Handler {
 	})
 	mux.HandleFunc("POST /admin/api/models/sync", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminModelsSync(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/models/fetch", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminModelsFetch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/models/save", func(w http.ResponseWriter, r *http.Request) {
+		serveAdminModelsSave(w, r, options)
 	})
 	mux.HandleFunc("GET /admin/api/accounts/quota", func(w http.ResponseWriter, r *http.Request) {
 		serveAdminAccountsQuota(w, r, options)
@@ -713,7 +761,7 @@ func projectChatChoiceShellArgs(choice map[string]any, keys map[string]string) {
 		name := strings.TrimSpace(fmt.Sprint(fn["name"]))
 		args := strings.TrimSpace(fmt.Sprint(fn["arguments"]))
 		if name != "" && args != "" && toolcall.IsShellTool(name) {
-			pref := "cmd"
+			pref := toolcall.DefaultShellArgKey(name)
 			if keys != nil {
 				if v := strings.TrimSpace(keys[name]); v != "" {
 					pref = v
@@ -743,7 +791,7 @@ func projectOneChatToolCall(call map[string]any, keys map[string]string) {
 	if name == "" || args == "" || !toolcall.IsShellTool(name) {
 		return
 	}
-	pref := "cmd"
+	pref := toolcall.DefaultShellArgKey(name)
 	if keys != nil {
 		if v := strings.TrimSpace(keys[name]); v != "" {
 			pref = v
@@ -785,18 +833,45 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	// Coalesce pure text/reasoning passthrough frames to cut Flush storms.
 	pending := make([]byte, 0, 1024)
 	firstPayloadFlushed := false
+	// Clear pending only after full delivery (LastOK). Soft short-writes advance by
+	// LastWritten so the accepted prefix is not re-sent (duplicate text) and the
+	// remainder stays buffered for drain / force retry (incomplete text fix).
 	flushPending := func(force bool) error {
 		if len(pending) == 0 {
 			return nil
 		}
-		payload := pending
-		pending = pending[:0]
-		streamCoalesceFlush.Add(1)
-		if err := sw.WriteBytes(payload, force || sw.SoftGone()); err != nil {
-			return err
+		attempts := 1
+		if force {
+			attempts = 3
 		}
-		if sw.LastOK() {
-			firstPayloadFlushed = true
+		var lastErr error
+		for i := 0; i < attempts && len(pending) > 0; i++ {
+			if i > 0 {
+				time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+			}
+			payload := pending
+			streamCoalesceFlush.Add(1)
+			lastErr = sw.WriteBytes(payload, force || sw.SoftGone())
+			if lastErr != nil {
+				return lastErr
+			}
+			if sw.LastOK() {
+				pending = pending[:0]
+				firstPayloadFlushed = true
+				return nil
+			}
+			// Soft fail: drop only the bytes that landed; keep the tail.
+			if n := sw.LastWritten(); n > 0 {
+				if n >= len(pending) {
+					pending = pending[:0]
+				} else {
+					pending = append(pending[:0], pending[n:]...)
+				}
+				if len(pending) == 0 {
+					firstPayloadFlushed = true
+					return nil
+				}
+			}
 		}
 		return nil
 	}
@@ -949,8 +1024,19 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 		if err := sw.WriteBytes(frame, true); err != nil {
 			return err
 		}
-		if sw.LastOK() && sawRealPayload {
-			firstPayloadFlushed = true
+		if sw.LastOK() {
+			if sawRealPayload {
+				firstPayloadFlushed = true
+			}
+		} else if n := sw.LastWritten(); n > 0 && n < len(frame) {
+			// Soft short-write of a forced frame: keep the unsent tail for drain.
+			pending = append(pending, frame[n:]...)
+			if sawRealPayload {
+				firstPayloadFlushed = true
+			}
+		} else if !sw.LastOK() && sw.LastWritten() == 0 {
+			// Soft fail with nothing landed: re-buffer whole frame for drain.
+			pending = append(pending, frame...)
 		}
 		return nil
 	}, func() error {
@@ -966,7 +1052,13 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	// Soft disconnect / write abort / mid-stream upstream drop after tools or
 	// content started: force-finish so clients do not hang, and avoid a second
 	// error JSON that Claude Code reports as "Server error mid-response".
-	_ = flushPending(true)
+	// Drain coalesced text with retries — soft-fail must not drop pending bytes.
+	for drain := 0; drain < 3 && len(pending) > 0; drain++ {
+		_ = flushPending(true)
+		if sw.LastOK() && len(pending) == 0 {
+			break
+		}
+	}
 	hasStreamPayload := assembler.Holding() || assembler.EmittedAny() || sawRealPayload
 	clientSoft := sw.SoftGone() || errors.Is(err, r.Context().Err()) || isSoftClientWriteError(err)
 	upstreamMid := err != nil && !clientSoft
@@ -997,7 +1089,26 @@ func releaseServerPick(options Options, accountID string) {
 }
 
 func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
-	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
+	usageMap, _ := usage.(map[string]any)
+	// Soft-close / omitted upstream usage: fill from request body so admin does not
+	// show ok=true with all-zero tokens (hollow success with TTFT>0).
+	filled, flags := fillMissingUsage(usageMap, requestBody, 0)
+	// Only apply fill on successful deliveries; failures stay zero unless upstream sent real usage.
+	if ok {
+		usageMap = filled
+		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
+		if p == 0 && c == 0 && t == 0 && ttftMS > 0 {
+			filled2, flags2 := fillMissingUsage(usageMap, requestBody, 1)
+			usageMap = filled2
+			flags = flags2
+			flags.EstimatedCompletion = true
+			flags.Missing = true
+		}
+	} else if usageMap == nil {
+		usageMap = map[string]any{}
+		flags = usageFillFlags{}
+	}
+	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usageMap)
 	streamValue := stream
 	var apiKeyID string
 	if apiKey != nil {
@@ -1012,6 +1123,10 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 	if ttftMS > 0 {
 		v := ttftMS
 		ttftPtr = &v
+	}
+	detail := usageDetail("go_chat", requestBody, ttftMS, latency)
+	if ok {
+		flags.apply(detail)
 	}
 	// Fire-and-forget with longer timeout - usage recording should not block response
 	go func() {
@@ -1040,7 +1155,7 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 				LatencyMS:           &latency,
 				TTFTMS:              ttftPtr,
 				Error:               errText,
-				Detail:              usageDetail("go_chat", requestBody, ttftMS, latency),
+				Detail:              detail,
 			}); err != nil {
 				slog.Warn("record usage failed", "error", err, "account_id", accountID, "model", model, "ok", ok)
 			}
@@ -1064,7 +1179,7 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 		if ok {
 			if options.Store != nil {
 				// preserve still-active free-usage windows, but heal stale markers.
-				_ = options.Store.ReportPoolSuccess(ctx, accountID, true)
+				_ = options.Store.ReportPoolSuccess(ctx, accountID, false) /* success clears sticky cool */
 			}
 			touchRedisPool(options, accountID, true, "", nil, status)
 			return
@@ -1117,10 +1232,17 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 		if decision.TokensLimit != nil {
 			failure.CooldownTokensLimit = decision.TokensLimit
 		}
-		// Soft-block model only when classifier sets BlockModel (not free-usage cool).
-		if decision.BlockModel && coolModel != "" && cooldown != nil {
+		// Soft-block model when classifier sets BlockModel (empty model output → 模型封禁).
+		// BlockUntil uses decision.Until even when ShouldCooldown is false so
+		// empty-upstream rows land in model_blocked without sticky account cool.
+		if decision.BlockModel && coolModel != "" {
+			until := decision.Until
+			if until == nil {
+				t := time.Now().Add(10 * time.Minute)
+				until = &t
+			}
 			failure.BlockedModel = coolModel
-			failure.BlockedUntil = cooldown
+			failure.BlockedUntil = until
 		}
 		if options.Store != nil {
 			// Only record durable failure/cooldown when classifier says so.
@@ -1544,10 +1666,7 @@ func clampCodexReasoning(raw, body map[string]any, userAgent string, enabled boo
 	if !enabled || body == nil {
 		return
 	}
-	tools := any(nil)
-	if body != nil {
-		tools = body["tools"]
-	}
+	tools := body["tools"]
 	if tools == nil && raw != nil {
 		tools = raw["tools"]
 	}
@@ -1555,20 +1674,38 @@ func clampCodexReasoning(raw, body map[string]any, userAgent string, enabled boo
 	if !historycompact.LooksLikeCodexRequest(userAgent, tools, raw) {
 		return
 	}
-	// Force low effort for Codex/OpenAI-native TTFT. Explicit values are overwritten
-	// because xhigh/high dominate first-token latency on grok-4.5.
-	body["reasoning_effort"] = "low"
-	body["reasoning"] = map[string]any{"effort": "low", "summary": "auto"}
-	if raw != nil {
-		raw["reasoning_effort"] = "low"
+
+	// Honor explicit Codex thinking mode. Old behavior always rewrote effort to
+	// low for TTFT, so UI Ultra/High/Proactive still showed (and ran) as low.
+	// Mapping: Low/auto→low · Base/default→medium · High/Proactive→high · Ultra→high.
+	client := reasoning.FromRequest(raw)
+	if client == "" {
+		client = reasoning.FromRequest(body)
+	}
+	up := reasoning.ToUpstream(client)
+	if up == "" {
+		// No explicit effort → keep TTFT-friendly low default.
+		up = reasoning.Low
+		client = reasoning.ClientLow
+	}
+
+	body["reasoning_effort"] = up
+	body["reasoning"] = map[string]any{"effort": up, "summary": "auto"}
+	if raw == nil {
+		return
+	}
+	// Preserve client-facing label on raw for usage detail (ultra→ultracode…).
+	// Only fill when the client omitted effort entirely.
+	if reasoning.FromRequest(raw) == "" {
+		raw["reasoning_effort"] = client
 		if m, ok := raw["reasoning"].(map[string]any); ok && m != nil {
-			m["effort"] = "low"
-			if _, ok := m["summary"]; !ok {
+			if strings.TrimSpace(fmt.Sprint(m["effort"])) == "" {
+				m["effort"] = client
+			}
+			if _, has := m["summary"]; !has {
 				m["summary"] = "auto"
 			}
 			raw["reasoning"] = m
-		} else {
-			raw["reasoning"] = map[string]any{"effort": "low", "summary": "auto"}
 		}
 	}
 }
@@ -1608,8 +1745,9 @@ func allowedToolNamesFrom(ctx context.Context) []string {
 }
 
 // ensureCodexShellCmdKeys forces shell-like tools to project args as "cmd" for
-// Codex clients. Codex validates against its local tool schema (cmd), while we
-// still send "command" upstream to Grok.
+// Codex clients, while preserving pure OpenAI/Hermes "command" schemas.
+// Codex validates against its local tool schema (cmd); we still send "command"
+// upstream to Grok. Hermes agent tool "terminal" requires "command".
 func ensureCodexShellCmdKeys(tools any, keys map[string]string) map[string]string {
 	if keys == nil {
 		keys = map[string]string{}
@@ -1630,7 +1768,7 @@ func ensureCodexShellCmdKeys(tools any, keys map[string]string) map[string]strin
 		if name == "" {
 			continue
 		}
-		// Only shell family (include Codex exec_command / run_command / shell_command).
+		// Only shell family (include Codex exec_command / Hermes terminal / shell_command).
 		if !toolcall.IsShellTool(name) {
 			continue
 		}
@@ -1662,12 +1800,25 @@ func ensureCodexShellCmdKeys(tools any, keys map[string]string) map[string]strin
 					}
 				}
 			}
+			// Schema prefers command but properties missing/opaque (e.g. Hermes
+			// terminal with incomplete params). Use name-aware default so we do
+			// not rewrite Hermes "command" into Codex "cmd".
+			if toolcall.DefaultShellArgKey(name) == "command" {
+				keys[name] = "command"
+				keys[strings.ToLower(name)] = "command"
+				if nk := toolcall.NameKey(name); nk != "" {
+					keys[nk] = "command"
+				}
+				continue
+			}
 		}
-		// Default Codex shell → cmd (Codex local schema field name).
-		keys[name] = "cmd"
-		keys[strings.ToLower(name)] = "cmd"
+		// Default Codex shell → cmd (Codex local schema field name), unless the
+		// tool itself is known to use OpenAI-style "command" (Hermes terminal).
+		fallback := toolcall.DefaultShellArgKey(name)
+		keys[name] = fallback
+		keys[strings.ToLower(name)] = fallback
 		if nk := toolcall.NameKey(name); nk != "" {
-			keys[nk] = "cmd"
+			keys[nk] = fallback
 		}
 	}
 	return keys
@@ -2048,7 +2199,70 @@ func bindResponseAffinity(ctx context.Context, options Options, responseID, acco
 }
 
 func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
-	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
+	usageMap, _ := usage.(map[string]any)
+	// Stream path may already have filled completion from LiveStreamer (fillStreamUsage).
+	// Always re-run fill with request body so prompt/total never stay hollow when ok.
+	hint := 0
+	if ok {
+		// If stream already put a completion estimate in usage, keep it via merge max.
+		if _, c, _, _, _, _ := postgres.UsageFromOpenAI(usageMap); c > 0 {
+			hint = int(c)
+		}
+		if hint <= 0 && ttftMS > 0 {
+			hint = 1 // TTFT>0 proves client saw payload
+		}
+	}
+	filled, flags := fillMissingUsage(usageMap, requestBody, hint)
+	if ok {
+		usageMap = filled
+		// Final hard guarantee: never write ok=true with all-zero tokens when TTFT>0.
+		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
+		if (p == 0 || c == 0 || t == 0 || t < p+c) && ttftMS > 0 {
+			if c <= 0 {
+				c = 1
+			}
+			if p <= 0 {
+				if est := estimatePromptTokens(requestBody); est > 0 {
+					p = int64(est)
+					flags.EstimatedPrompt = true
+				} else {
+					p = 1
+					flags.EstimatedPrompt = true
+				}
+			}
+			if t < p+c {
+				t = p + c
+				flags.EstimatedTotal = true
+			}
+			flags.Missing = true
+			if c == 1 {
+				flags.EstimatedCompletion = true
+			}
+			usageMap = map[string]any{
+				"prompt_tokens":     p,
+				"completion_tokens": c,
+				"total_tokens":      t,
+				"input_tokens":      p,
+				"output_tokens":     c,
+			}
+			if _, _, _, cr, cc, rs := postgres.UsageFromOpenAI(filled); true {
+				if cr > 0 {
+					usageMap["cache_read_tokens"] = cr
+					usageMap["cached_tokens"] = cr
+				}
+				if cc > 0 {
+					usageMap["cache_creation_tokens"] = cc
+				}
+				if rs > 0 {
+					usageMap["reasoning_tokens"] = rs
+				}
+			}
+		}
+	} else if usageMap == nil {
+		usageMap = map[string]any{}
+		flags = usageFillFlags{}
+	}
+	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usageMap)
 	streamValue := stream
 	var apiKeyID string
 	if apiKey != nil {
@@ -2073,6 +2287,9 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		detail["ttft_ms"] = ttftMS
 	}
 	detail["latency_ms"] = latency
+	if ok {
+		flags.apply(detail)
+	}
 	// Fire-and-forget with longer timeout - usage recording should not block response
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2118,9 +2335,10 @@ func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]st
 	for _, call := range calls {
 		name := strings.TrimSpace(call.Name)
 		args := call.Arguments
-		// Project shell args to client schema (Codex: cmd). Internal form is command.
+		// Project shell args to client schema (Codex: cmd; Hermes terminal: command).
+		// Internal form is always "command".
 		if toolcall.IsShellTool(name) {
-			preferred := "cmd"
+			preferred := toolcall.DefaultShellArgKey(name)
 			if v := strings.TrimSpace(keys[name]); v != "" {
 				preferred = v
 			} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
@@ -2321,16 +2539,26 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// Claude Code "Tool use interrupted". Keep assembling; only best-effort write.
 	sw := newSSEWriter(w, flusher, r.Context())
 	var writeMu sync.Mutex
-	// writeFrames writes one logical batch via shared sseWriter. Soft errors leave
-	// LastOK=false so callers Requeue instead of Acking half-open tool_use.
+	// writeFrames writes one logical batch via shared sseWriter.
+	// Soft short-writes resume at complete SSE frame boundaries (not full-buffer
+	// retry) so content_block_start is never duplicated mid-tool-group — that was
+	// a major intermittent "Tool use interrupted" source under write pressure.
 	// Force is automatic once envelope is open so terminal tools can still land.
-	writeFrames := func(frames []string, force bool) error {
+	// Returns the complete-frame-aligned payload that landed (for Ack).
+	writeFrames := func(frames []string, force bool) (delivered string, fullOK bool, err error) {
 		if len(frames) == 0 {
-			return nil
+			return "", true, nil
 		}
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return sw.WriteStrings(frames, force || envelopeOpen || sw.SoftGone())
+		forceWrite := force || envelopeOpen || sw.SoftGone()
+		// Tool/terminal groups: more resume attempts under softGone so rem tail
+		// (content_block_stop / message_stop) still lands after a short write.
+		attempts := 3
+		if forceWrite {
+			attempts = 5
+		}
+		return sw.WriteStringsResumable(frames, forceWrite, attempts)
 	}
 	// ackBatchFromFrames marks only what this Write batch actually contained.
 	// Blind AckEmittedTools after a text/thinking-only flush would wrongly mark
@@ -2338,16 +2566,23 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// pending stuck. Both paths surface as intermittent "Tool use interrupted".
 	// Each tool group is one content_block_start with content_block.type=tool_use
 	// (see anthropic.event JSON: `"type":"tool_use"` once per group).
-	ackBatchFromFrames := func(batch []string) {
-		joined := strings.Join(batch, "")
+	ackBatchFromFrames := func(joined string, fullOK bool) {
+		if joined == "" {
+			return
+		}
 		if strings.Contains(joined, "event: message_start") || strings.Contains(joined, `"type":"message_start"`) {
 			assembler.AckMessageStart()
 		}
-		// Content-based tool Ack (by tool id in payload), not FIFO count. Multi-tool
-		// Finish writes groups independently; soft-fail of tool0 + success of tool1
-		// must not Ack tool0 via AckFirstPendingTools(1).
-		if strings.Contains(joined, `"type":"tool_use"`) || strings.Contains(joined, "tool_use") {
+		// Tool Ack only when full group landed (fullOK) or content_block_stop is present.
+		// Acking on content_block_start alone after short-write left half-open tool_use.
+		hasTool := strings.Contains(joined, `"type":"tool_use"`) || strings.Contains(joined, "tool_use")
+		hasToolStop := strings.Contains(joined, "content_block_stop")
+		if hasTool && (fullOK || hasToolStop) {
 			assembler.AckToolsInPayload(joined)
+		}
+		if strings.Contains(joined, "text_delta") || strings.Contains(joined, "thinking_delta") ||
+			strings.Contains(joined, `"type":"text"`) || strings.Contains(joined, `"type":"thinking"`) {
+			assembler.AckContentDelivered()
 		}
 		if strings.Contains(joined, "event: message_stop") || strings.Contains(joined, `"type":"message_stop"`) {
 			assembler.AckTerminal()
@@ -2358,26 +2593,60 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// pendingSSE coalesces live thinking/text micro-deltas (Claude Code long
 	// thinking turns) so we do not Flush once per token. Flushed on tool groups,
 	// terminal, size, idle, or first client-visible payload (TTFT).
+	//
+	// Only clear after full delivery (LastOK). Soft short-writes advance by
+	// LastWritten so the accepted prefix is not re-sent and the tail is kept
+	// for tool-boundary / idle / Finish drain. Full-buffer drop on soft-fail
+	// used to truncate Claude Code thinking/text (Finish only closes blocks —
+	// it does not re-emit lost text_delta frames).
 	pendingSSE := make([]byte, 0, textCoalesceMax*2)
 	firstPayloadFlushed := false
 	flushPendingSSE := func(force bool) error {
 		if len(pendingSSE) == 0 {
 			return nil
 		}
-		payload := pendingSSE
-		pendingSSE = pendingSSE[:0]
-		streamCoalesceFlush.Add(1)
-		// Direct WriteBytes: payload is already concatenated SSE frames.
-		writeMu.Lock()
-		err := sw.WriteBytes(payload, force || sw.SoftGone() || envelopeOpen)
-		writeMu.Unlock()
-		if err != nil {
-			return err
+		attempts := 1
+		if force {
+			attempts = 3
 		}
-		if sw.LastOK() {
-			envelopeOpen = true
-			firstPayloadFlushed = true
+		var lastErr error
+		for i := 0; i < attempts && len(pendingSSE) > 0; i++ {
+			if i > 0 {
+				time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+			}
+			payload := pendingSSE
+			streamCoalesceFlush.Add(1)
+			// Direct WriteBytes: payload is already concatenated SSE frames.
+			writeMu.Lock()
+			lastErr = sw.WriteBytes(payload, force || sw.SoftGone() || envelopeOpen)
+			writeMu.Unlock()
+			if lastErr != nil {
+				return lastErr
+			}
+			if sw.LastOK() {
+				pendingSSE = pendingSSE[:0]
+				envelopeOpen = true
+				firstPayloadFlushed = true
+				assembler.AckContentDelivered()
+				return nil
+			}
+			// Soft fail: advance past accepted bytes; keep unsent tail.
+			if n := sw.LastWritten(); n > 0 {
+				if n >= len(pendingSSE) {
+					pendingSSE = pendingSSE[:0]
+				} else {
+					pendingSSE = append(pendingSSE[:0], pendingSSE[n:]...)
+				}
+				if len(pendingSSE) == 0 {
+					envelopeOpen = true
+					firstPayloadFlushed = true
+					// Partial short-write may still have delivered some text.
+					assembler.AckContentDelivered()
+					return nil
+				}
+			}
 		}
+		// Soft-fail with residual: leave pendingSSE for later force drain.
 		return nil
 	}
 	// Precompute keepalive once — Ping()+CommentKeepalive() allocate every call.
@@ -2395,16 +2664,25 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		if len(all) == 0 {
 			return nil
 		}
-		if err := writeFrames(all, force || sw.SoftGone() || envelopeOpen); err != nil {
+		delivered, fullOK, err := writeFrames(all, force || sw.SoftGone() || envelopeOpen)
+		if err != nil {
 			if requeueOnSoft && assembler.HasUnackedTools() {
 				assembler.RequeueUnackedTools()
 			}
 			return err
 		}
-		envelopeOpen = true
-		if sw.LastOK() {
-			ackBatchFromFrames(all)
-		} else if requeueOnSoft && assembler.HasUnackedTools() {
+		if delivered != "" {
+			envelopeOpen = true
+		}
+		if fullOK {
+			ackBatchFromFrames(delivered, true)
+			return nil
+		}
+		// Soft incomplete: Ack only safe complete pieces (tools need content_block_stop).
+		if delivered != "" {
+			ackBatchFromFrames(delivered, false)
+		}
+		if requeueOnSoft && assembler.HasUnackedTools() {
 			assembler.RequeueUnackedTools()
 		}
 		return nil
@@ -2638,13 +2916,6 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		hasTools := len(delta.AnthropicToolDeltas()) > 0
 		if hasContent || hasReasoning || hasTools {
 			sawModel = true
-			// TTFT = first real model payload (not empty SSE / not message_start alone).
-			if firstTokenMS == 0 {
-				firstTokenMS = int(time.Since(started).Milliseconds())
-				if firstTokenMS <= 0 {
-					firstTokenMS = 1
-				}
-			}
 		}
 		// Live path: do NOT force-flush pure thinking/text (coalesce). Tools/start
 		// inside Feed still force via needImmediate classification in emitFrames.
@@ -2657,6 +2928,15 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 			}
 			wroteFrames = true
 		}
+		// TTFT only after client-visible payload was successfully written (not mere
+		// upstream delta arrival). Prevents admin rows with ttft>0 + empty 502 when
+		// frames soft-failed / incomplete tools never emitted.
+		if firstTokenMS == 0 && assembler.PayloadDelivered() {
+			firstTokenMS = int(time.Since(started).Milliseconds())
+			if firstTokenMS <= 0 {
+				firstTokenMS = 1
+			}
+		}
 		// Incomplete tool args / held text: throttled keepalive. Skip when we just
 		// wrote real frames this tick (socket already warm).
 		if assembler.NeedsClientKeepalive() && !wroteFrames && len(pendingSSE) == 0 {
@@ -2666,7 +2946,24 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	}, onIdle)
 
 	// Drain any coalesced thinking/text before terminal Finish / empty checks.
-	_ = flushPendingSSE(true)
+	// Retry while soft-fail left bytes — lost text_delta is not rebuilt by Finish.
+	for drain := 0; drain < 3 && len(pendingSSE) > 0; drain++ {
+		_ = flushPendingSSE(true)
+		if sw.LastOK() && len(pendingSSE) == 0 {
+			break
+		}
+	}
+
+	// fillAnthropicStreamUsage patches zero usage from assembler output when upstream
+	// omitted the usage frame (soft-close / short tool turns → admin hollow success).
+	fillAnthropicStreamUsage := func(u map[string]any) map[string]any {
+		hint := 0
+		if assembler != nil {
+			hint = assembler.EstimateOutputTokens()
+		}
+		filled, _ := fillMissingUsage(u, nil, hint)
+		return filled
+	}
 
 	clientGone := sw.SoftGone() || probe.gone || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
 	// Real payload = model deltas OR assembler emitted/held content/tools.
@@ -2681,7 +2978,7 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	if upstreamMidError && !hasPayload {
 		msg, errType := anthropicErrorFromCause(err)
 		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
-		return openAIUsage, firstTokenMS, err
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, err
 	}
 	if !hasPayload {
 		// Soft disconnect before any model payload is still a hollow stream —
@@ -2689,11 +2986,11 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		if clientGone {
 			_ = emitFrames(assembler.Finish("stop", usage), true)
-			return openAIUsage, firstTokenMS, empty
+			return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
 		}
 		msg, errType := anthropicErrorFromCause(empty)
 		_ = emitFrames(anthropic.TerminalError(msg, errType), true)
-		return openAIUsage, firstTokenMS, empty
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
 	}
 	if finish == "" {
 		finish = "stop"
@@ -2706,13 +3003,15 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 	// group Requeues (clears pending) — NeedsFinishRetry still sees
 	// !TerminalDelivered / pending tools and forces another Finish.
 	if termErr := emitFrames(assembler.Finish(finish, usage), true); termErr != nil && !clientGone && !upstreamMidError {
-		return openAIUsage, firstTokenMS, termErr
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, termErr
 	}
 	// Soft-fail recovery: more Finish rebuilds (tools + message_stop). Each rebuild
 	// re-emits only unacked/pending work; Ack'd tools are skipped. Requeue also
 	// UnackTerminal when tools need re-emit so tool_use never follows message_stop
 	// ("Tool use interrupted").
-	for attempt := 0; attempt < 4 && assembler.NeedsFinishRetry(); attempt++ {
+	// More Finish rebuilds for stubborn soft short-writes (tool start landed,
+	// stop frame still pending). Each rebuild re-emits only unacked work.
+	for attempt := 0; attempt < 6 && assembler.NeedsFinishRetry(); attempt++ {
 		_ = emitFrames(assembler.Finish(finish, usage), true)
 	}
 	// After Finish, incomplete-only tools (never started) + no text is empty —
@@ -2723,27 +3022,41 @@ func streamAnthropicMessagesWithOptions(w http.ResponseWriter, r *http.Request, 
 		if !assembler.TerminalDelivered() {
 			_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
 		}
-		return openAIUsage, firstTokenMS, empty
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
 	}
-	// Recovery exhausted with half-open tools / no terminal: fail (not soft-ok).
-	// clientGone after undelivered tools is still a failure — Claude Code shows
-	// "Tool use interrupted" and admin must not record ok=true tokens=0.
-	if !assembler.ClientDeliveryOK() {
+	if assembler.ClientDeliveryOK() {
+		if clientGone || upstreamMidError {
+			// Soft terminal: client left, or upstream dropped after FULL delivery.
+			return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, nil
+		}
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, err
+	}
+	// Recovery exhausted. Distinguish half-open tools vs delivered-payload soft-close
+	// vs incomplete-only empty. Emitting TerminalError after a real tool/text delivery
+	// is what Claude Code surfaces as intermittent "Tool use interrupted".
+	if assembler.HalfOpenTools() {
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		if !assembler.TerminalDelivered() {
 			_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
 		}
 		if upstreamMidError && err != nil {
-			return openAIUsage, firstTokenMS, err
+			return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, err
 		}
-		return openAIUsage, firstTokenMS, empty
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
 	}
-	if clientGone || upstreamMidError {
-		// Soft terminal: client left, or upstream dropped after FULL delivery.
-		// Do not return the raw upstream err — stream already closed cleanly.
-		return openAIUsage, firstTokenMS, nil
+	if assembler.PayloadDelivered() {
+		// Soft-close: client already has usable output (tools Ack'd / content written).
+		// Do not TerminalError over a real delivery when only message_stop soft-failed.
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, nil
 	}
-	return openAIUsage, firstTokenMS, err
+	empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+	if !assembler.TerminalDelivered() {
+		_ = emitFrames(anthropic.TerminalError(empty.Error(), "api_error"), true)
+	}
+	if upstreamMidError && err != nil {
+		return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, err
+	}
+	return fillAnthropicStreamUsage(openAIUsage), firstTokenMS, empty
 }
 
 // isSoftClientWriteError reports client-side stream aborts that should still run
@@ -2818,7 +3131,25 @@ func (p *disconnectProbe) check(ctx context.Context) bool {
 }
 
 func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
-	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usage)
+	usageMap, _ := usage.(map[string]any)
+	// Soft-close / omitted upstream usage: fill prompt from request body and keep
+	// any completion estimate the stream already attached (from OutputRunes).
+	filled, flags := fillMissingUsage(usageMap, requestBody, 0)
+	if ok {
+		usageMap = filled
+		p, c, t, _, _, _ := postgres.UsageFromOpenAI(usageMap)
+		if p == 0 && c == 0 && t == 0 && ttftMS > 0 {
+			filled2, flags2 := fillMissingUsage(usageMap, requestBody, 1)
+			usageMap = filled2
+			flags = flags2
+			flags.EstimatedCompletion = true
+			flags.Missing = true
+		}
+	} else if usageMap == nil {
+		usageMap = map[string]any{}
+		flags = usageFillFlags{}
+	}
+	prompt, completion, total, cacheRead, cacheCreate, reasoning := postgres.UsageFromOpenAI(usageMap)
 	streamValue := stream
 	var apiKeyID string
 	if apiKey != nil {
@@ -2871,6 +3202,9 @@ func recordAnthropicUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 					}
 					if ttftMS <= 0 {
 						d["ttft_missing"] = true
+					}
+					if ok {
+						flags.apply(d)
 					}
 					return d
 				}(),
@@ -3288,7 +3622,7 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"accounts":             accounts,
 		"pool": map[string]any{
 			"mode": pool.Mode, "total": pool.Total, "live": pool.Live, "rotatable": pool.Rotatable,
-			"enabled": pool.Enabled, "in_cooldown": pool.InCooldown, "quota_disabled": pool.QuotaDisabled,
+			"enabled": pool.Enabled, "in_cooldown": pool.InCooldown, "cooldown_stacks": pool.CooldownStacks, "quota_disabled": pool.QuotaDisabled,
 			"model_blocked": pool.ModelBlocked, "expired": pool.Expired, "disabled": pool.Disabled, "source": pool.Source,
 		},
 		"keys":                  keyStats,
@@ -3302,6 +3636,8 @@ func serveAdminStatus(w http.ResponseWriter, r *http.Request, options Options, p
 		"leader":                leaderStatus(r.Context(), options),
 		"redis":                 map[string]any{"enabled": redisEnabled, "prefix": options.Config.RedisPrefix},
 		"stream":                streamSnapshot(),
+		// Never block /status on a live upstream probe — only attach a recent cache.
+		"upstream_status": cachedUpstreamStatus(),
 	}
 	if protected {
 		payload["credentials"] = map[string]any{"email": nil, "active_count": pool.Live, "account_count": accountCount, "ok": pool.Live > 0}
@@ -3457,17 +3793,18 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	}
 	if poolSum != nil {
 		payload["pool"] = map[string]any{
-			"mode":           poolSum.Mode,
-			"total":          poolSum.Total,
-			"live":           poolSum.Live,
-			"rotatable":      poolSum.Rotatable,
-			"enabled":        poolSum.Enabled,
-			"in_cooldown":    poolSum.InCooldown,
-			"quota_disabled": poolSum.QuotaDisabled,
-			"model_blocked":  poolSum.ModelBlocked,
-			"expired":        poolSum.Expired,
-			"disabled":       poolSum.Disabled,
-			"source":         poolSum.Source,
+			"mode":            poolSum.Mode,
+			"total":           poolSum.Total,
+			"live":            poolSum.Live,
+			"rotatable":       poolSum.Rotatable,
+			"enabled":         poolSum.Enabled,
+			"in_cooldown":     poolSum.InCooldown,
+			"cooldown_stacks": poolSum.CooldownStacks,
+			"quota_disabled":  poolSum.QuotaDisabled,
+			"model_blocked":   poolSum.ModelBlocked,
+			"expired":         poolSum.Expired,
+			"disabled":        poolSum.Disabled,
+			"source":          poolSum.Source,
 		}
 	}
 	writeJSON(w, http.StatusOK, payload)
@@ -3485,7 +3822,23 @@ func registrationClient(options Options) *regclient.Client {
 	if base == "" {
 		return nil
 	}
-	return &regclient.Client{BaseURL: base, Token: token}
+	// Shared fail-fast client: admin polls every ~0.3s; never hang on DefaultClient.
+	// 2s total keeps under the browser reg-poll abort (2.2s) so the UI never waits
+	// on a stuck Go→sidecar round-trip.
+	return &regclient.Client{
+		BaseURL: base,
+		Token:   token,
+		HTTP: &http.Client{
+			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 800 * time.Millisecond}).DialContext,
+				MaxIdleConns:          64,
+				MaxIdleConnsPerHost:   16,
+				IdleConnTimeout:       30 * time.Second,
+				ResponseHeaderTimeout: 1500 * time.Millisecond,
+			},
+		},
+	}
 }
 
 func requireAdminReadWrite(w http.ResponseWriter, r *http.Request, options Options, write bool) bool {
@@ -3809,6 +4162,37 @@ func loadRegistrationConfig(ctx context.Context, options Options, includeSecrets
 		}
 	}
 	cfg = normalizeRegistrationConfig(cfg)
+	sanitizeRegistrationMailSecrets(cfg)
+	// Env fallback when durable MoeMail slot was wiped by historical key pollution.
+	if strings.TrimSpace(stringValue(cfg["moemail_api_key"])) == "" {
+		envKey := strings.TrimSpace(os.Getenv("GROK2API_MOEMAIL_API_KEY"))
+		if envKey == "" {
+			envKey = strings.TrimSpace(os.Getenv("MOEMAIL_API_KEY"))
+		}
+		if envKey != "" && mailSecretFitsSlot("moemail_api_key", envKey) {
+			cfg["moemail_api_key"] = envKey
+		}
+	}
+	if strings.TrimSpace(stringValue(cfg["moemail_base_url"])) == "" {
+		u := strings.TrimSpace(os.Getenv("GROK2API_MOEMAIL_BASE_URL"))
+		if u == "" {
+			u = strings.TrimSpace(os.Getenv("MOEMAIL_BASE_URL"))
+		}
+		if u != "" {
+			cfg["moemail_base_url"] = u
+		}
+	}
+	if strings.TrimSpace(stringValue(cfg["moemail_domain"])) == "" {
+		d := strings.TrimSpace(os.Getenv("GROK2API_MOEMAIL_DOMAIN"))
+		if d == "" {
+			d = strings.TrimSpace(os.Getenv("MOEMAIL_DOMAIN"))
+		}
+		if d != "" {
+			cfg["moemail_domain"] = d
+		}
+	}
+	// Rebuild active mirrors after env fill.
+	sanitizeRegistrationMailSecrets(cfg)
 	if !includeSecrets {
 		for k := range registrationSecretKeys {
 			if v := strings.TrimSpace(stringValue(cfg[k])); v != "" {
@@ -3839,10 +4223,16 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 		}
 	}
 	// Merge patch: empty secrets keep previous; masked secrets keep previous.
+	// Never accept cross-provider key shapes into the wrong dedicated slot
+	// (e.g. YYDS AC-* written into moemail_api_key by adapter remaps).
 	for k, v := range patch {
 		if _, isSecret := registrationSecretKeys[k]; isSecret {
 			s := strings.TrimSpace(fmt.Sprint(v))
 			if s == "" || isMaskedSecret(s) {
+				continue
+			}
+			if !mailSecretFitsSlot(k, s) {
+				// Drop polluted values so previous good secret (or env fallback) wins.
 				continue
 			}
 			current[k] = s
@@ -3852,15 +4242,235 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 		current[k] = v
 	}
 	current = normalizeRegistrationConfig(current)
+	sanitizeRegistrationMailSecrets(current)
+	// Ensure multi-provider slots are always explicit strings in DB so the admin
+	// UI can restore each service independently after switch.
+	for _, k := range []string{
+		"mail_provider",
+		"domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
+		"base_url", "moemail_base_url", "cfmail_base_url",
+	} {
+		if _, ok := current[k]; !ok {
+			current[k] = ""
+		} else if current[k] == nil {
+			current[k] = ""
+		} else {
+			current[k] = strings.TrimSpace(fmt.Sprint(current[k]))
+		}
+	}
 	if err := options.Store.SetSetting(ctx, "registration_config", current); err != nil {
 		return nil, err
 	}
 	return current, nil
 }
 
+// mailSecretFitsSlot reports whether a secret value belongs in the given
+// registration_config key. Used to stop adapter remaps (active key mirrored into
+// moemail_api_key) from permanently overwriting another provider's slot.
+func mailSecretFitsSlot(key, value string) bool {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return true
+	}
+	switch key {
+	case "moemail_api_key":
+		// MoeMail keys are typically mk_*; reject YYDS AC-* and common GPTMail sk-*.
+		if strings.HasPrefix(v, "AC-") || strings.HasPrefix(strings.ToLower(v), "sk-") {
+			return false
+		}
+		return true
+	case "yyds_api_key":
+		// YYDS is AC-*; reject MoeMail mk_* and GPTMail sk-*.
+		if strings.HasPrefix(v, "mk_") || strings.HasPrefix(strings.ToLower(v), "sk-") {
+			return false
+		}
+		return true
+	case "gptmail_api_key":
+		// GPTMail is optional / sk-* / opaque; never store MoeMail or YYDS shapes.
+		if strings.HasPrefix(v, "mk_") || strings.HasPrefix(v, "AC-") {
+			return false
+		}
+		return true
+	case "api_key":
+		// Generic active mirror — accept anything; sanitizeRegistrationMailSecrets
+		// rewrites it from the active provider slot.
+		return true
+	default:
+		return true
+	}
+}
+
+// sanitizeRegistrationMailSecrets removes cross-provider contamination already
+// present in a config map and rebuilds active api_key / domain / base_url mirrors
+// from dedicated slots only.
+func sanitizeRegistrationMailSecrets(cfg map[string]any) {
+	if cfg == nil {
+		return
+	}
+	mk := strings.TrimSpace(stringValue(cfg["moemail_api_key"]))
+	yk := strings.TrimSpace(stringValue(cfg["yyds_api_key"]))
+	gk := strings.TrimSpace(stringValue(cfg["gptmail_api_key"]))
+	ck := strings.TrimSpace(stringValue(cfg["cfmail_api_key"]))
+
+	// Rescue: polluted MoeMail slot holding YYDS key → move into yyds if empty.
+	if strings.HasPrefix(mk, "AC-") {
+		if yk == "" {
+			cfg["yyds_api_key"] = mk
+			yk = mk
+		}
+		cfg["moemail_api_key"] = ""
+		mk = ""
+	}
+	// Rescue: polluted GPTMail slot holding YYDS/MoeMail key.
+	if strings.HasPrefix(gk, "AC-") {
+		if yk == "" {
+			cfg["yyds_api_key"] = gk
+			yk = gk
+		}
+		cfg["gptmail_api_key"] = ""
+		gk = ""
+	}
+	if strings.HasPrefix(gk, "mk_") {
+		if mk == "" {
+			cfg["moemail_api_key"] = gk
+			mk = gk
+		}
+		cfg["gptmail_api_key"] = ""
+		gk = ""
+	}
+	// Rescue: polluted YYDS slot holding MoeMail key.
+	if strings.HasPrefix(yk, "mk_") {
+		if mk == "" {
+			cfg["moemail_api_key"] = yk
+			mk = yk
+		}
+		cfg["yyds_api_key"] = ""
+		yk = ""
+	}
+	if strings.HasPrefix(strings.ToLower(yk), "sk-") {
+		if gk == "" {
+			cfg["gptmail_api_key"] = yk
+			gk = yk
+		}
+		cfg["yyds_api_key"] = ""
+		yk = ""
+	}
+
+	// Active mirrors from dedicated slots (never leave a foreign key as api_key).
+	provider := strings.ToLower(strings.TrimSpace(stringValue(cfg["mail_provider"])))
+	switch provider {
+	case "yyds":
+		cfg["api_key"] = yk
+		if d := strings.TrimSpace(stringValue(cfg["yyds_domain"])); d != "" {
+			cfg["domain"] = d
+		}
+		// Do not clear durable moemail_base_url here — only start-merge remaps clear it.
+	case "gptmail":
+		cfg["api_key"] = gk
+		if d := strings.TrimSpace(stringValue(cfg["gptmail_domain"])); d != "" {
+			cfg["domain"] = d
+		}
+	case "cfmail":
+		cfg["api_key"] = ck
+		if d := strings.TrimSpace(stringValue(cfg["cfmail_domain"])); d != "" {
+			cfg["domain"] = d
+		}
+		if u := strings.TrimSpace(stringValue(cfg["cfmail_base_url"])); u != "" {
+			cfg["base_url"] = u
+		}
+	default: // moemail
+		cfg["api_key"] = mk
+		if d := strings.TrimSpace(stringValue(cfg["moemail_domain"])); d != "" {
+			cfg["domain"] = d
+		}
+		if u := strings.TrimSpace(stringValue(cfg["moemail_base_url"])); u != "" {
+			cfg["base_url"] = u
+		}
+	}
+	_ = mk
+	_ = yk
+	_ = gk
+	_ = ck
+}
+
+// registrationConfigPatchForPersist builds a DB-safe patch from a start request.
+// Adapter remaps put the active provider key into moemail_api_key / clear base URLs;
+// those must never be written back into durable per-provider slots.
+func registrationConfigPatchForPersist(req, merged map[string]any) map[string]any {
+	out := map[string]any{}
+	if merged != nil {
+		for k, v := range merged {
+			out[k] = v
+		}
+	}
+	// Prefer original request dedicated secrets when present and well-shaped.
+	for _, k := range []string{
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key",
+		"yescaptcha_key", "proxy_password",
+	} {
+		if req == nil {
+			break
+		}
+		s := strings.TrimSpace(stringValue(req[k]))
+		if s == "" || isMaskedSecret(s) {
+			// Leave merged value for now; sanitize / save rules handle empties.
+			continue
+		}
+		if mailSecretFitsSlot(k, s) {
+			out[k] = s
+		}
+	}
+	// Restore durable host fields that merge may have cleared for non-MoeMail runs.
+	if req != nil {
+		for _, k := range []string{"moemail_base_url", "cfmail_base_url", "base_url"} {
+			if s := strings.TrimSpace(stringValue(req[k])); s != "" {
+				out[k] = s
+			}
+		}
+		// Dedicated domains always from request when non-empty.
+		for _, k := range []string{"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "domain"} {
+			if _, ok := req[k]; ok {
+				// Allow explicit empty to clear.
+				out[k] = strings.TrimSpace(stringValue(req[k]))
+			}
+		}
+		if p := strings.TrimSpace(stringValue(req["mail_provider"])); p != "" {
+			out["mail_provider"] = p
+		}
+	}
+	// After overlay, drop remapped moemail_api_key when provider is not moemail —
+	// the durable MoeMail key must stay whatever was in the dedicated slot only.
+	provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
+	if provider != "moemail" && provider != "" {
+		// Remove adapter remaps so saveRegistrationConfig won't overwrite MoeMail.
+		delete(out, "moemail_api_key")
+		// Keep moemail_base_url out of the patch if merge cleared it (empty would
+		// not clear secrets, but would clear non-secret base on save).
+		if strings.TrimSpace(stringValue(out["moemail_base_url"])) == "" {
+			delete(out, "moemail_base_url")
+		}
+		if provider != "cfmail" && strings.TrimSpace(stringValue(out["base_url"])) == "" {
+			delete(out, "base_url")
+		}
+	} else {
+		// moemail: never persist a foreign key shape into moemail_api_key.
+		if k := strings.TrimSpace(stringValue(out["moemail_api_key"])); !mailSecretFitsSlot("moemail_api_key", k) {
+			delete(out, "moemail_api_key")
+		}
+		if k := strings.TrimSpace(stringValue(out["api_key"])); k != "" && !mailSecretFitsSlot("moemail_api_key", k) {
+			// Generic api_key was remapped from another provider — drop it.
+			delete(out, "api_key")
+		}
+	}
+	sanitizeRegistrationMailSecrets(out)
+	return out
+}
+
 func mergeRegistrationStartBody(ctx context.Context, options Options, body map[string]any) map[string]any {
 	out := map[string]any{}
 	saved, _ := loadRegistrationConfig(ctx, options, true)
+	// Drop any historically polluted cross-provider keys before merge.
+	sanitizeRegistrationMailSecrets(saved)
 	for k, v := range saved {
 		out[k] = v
 	}
@@ -3888,37 +4498,125 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 			out[k] = v
 		}
 	}
-	// Map form aliases used by UI/Python adapter.
+	// Normalize mail_provider first.
+	provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
+	switch provider {
+	case "yyds", "gptmail", "cfmail", "moemail":
+		// ok
+	default:
+		provider = "moemail"
+	}
+	out["mail_provider"] = provider
+
+	// Map active api_key into the provider-specific slot when missing.
+	// Only when the key shape matches the target slot — never re-pollute MoeMail
+	// with a leftover YYDS AC-* mirror in api_key.
 	if apiKey := strings.TrimSpace(stringValue(out["api_key"])); apiKey != "" {
-		provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
 		switch provider {
 		case "yyds":
-			if strings.TrimSpace(stringValue(out["yyds_api_key"])) == "" {
+			if strings.TrimSpace(stringValue(out["yyds_api_key"])) == "" && mailSecretFitsSlot("yyds_api_key", apiKey) {
 				out["yyds_api_key"] = apiKey
 			}
 		case "gptmail":
-			if strings.TrimSpace(stringValue(out["gptmail_api_key"])) == "" {
+			if strings.TrimSpace(stringValue(out["gptmail_api_key"])) == "" && mailSecretFitsSlot("gptmail_api_key", apiKey) {
 				out["gptmail_api_key"] = apiKey
 			}
 		case "cfmail":
 			if strings.TrimSpace(stringValue(out["cfmail_api_key"])) == "" {
 				out["cfmail_api_key"] = apiKey
 			}
-		default:
-			if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" {
+		default: // moemail
+			if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" && mailSecretFitsSlot("moemail_api_key", apiKey) {
 				out["moemail_api_key"] = apiKey
 			}
 		}
 	}
-	// Adapter expects moemail_* names for mail credentials historically.
-	if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" {
-		if v := strings.TrimSpace(stringValue(out["api_key"])); v != "" {
-			out["moemail_api_key"] = v
+
+	// Domain: prefer provider-specific slot, then generic domain.
+	activeDomain := strings.TrimSpace(stringValue(out["domain"]))
+	switch provider {
+	case "yyds":
+		if d := strings.TrimSpace(stringValue(out["yyds_domain"])); d != "" {
+			activeDomain = d
 		}
+		out["yyds_domain"] = activeDomain
+		out["domain"] = activeDomain
+	case "gptmail":
+		if d := strings.TrimSpace(stringValue(out["gptmail_domain"])); d != "" {
+			activeDomain = d
+		}
+		out["gptmail_domain"] = activeDomain
+		out["domain"] = activeDomain
+	case "cfmail":
+		if d := strings.TrimSpace(stringValue(out["cfmail_domain"])); d != "" {
+			activeDomain = d
+		}
+		out["cfmail_domain"] = activeDomain
+		out["domain"] = activeDomain
+	default:
+		if d := strings.TrimSpace(stringValue(out["moemail_domain"])); d != "" {
+			activeDomain = d
+		}
+		out["moemail_domain"] = activeDomain
+		out["domain"] = activeDomain
 	}
-	if strings.TrimSpace(stringValue(out["moemail_base_url"])) == "" {
-		if v := strings.TrimSpace(stringValue(out["base_url"])); v != "" {
-			out["moemail_base_url"] = v
+
+	// CRITICAL: Python adapter historically only reads moemail_api_key / moemail_base_url.
+	// When using YYDS/GPTMail/CFMail we MUST overwrite moemail_api_key with the
+	// active provider key — otherwise a previously saved MoeMail key is used.
+	switch provider {
+	case "yyds":
+		if k := strings.TrimSpace(stringValue(out["yyds_api_key"])); k != "" {
+			out["moemail_api_key"] = k
+			out["api_key"] = k
+		}
+		// Fixed host; never pass MoeMail base into YYDS.
+		out["moemail_base_url"] = ""
+		out["base_url"] = ""
+	case "gptmail":
+		if k := strings.TrimSpace(stringValue(out["gptmail_api_key"])); k != "" && mailSecretFitsSlot("gptmail_api_key", k) {
+			out["moemail_api_key"] = k
+			out["api_key"] = k
+		} else {
+			// GPTMail allows public test key when empty — leave empty for adapter.
+			// Also clear polluted AC-*/mk_* that must not be sent as GPTMail credentials.
+			out["gptmail_api_key"] = ""
+			out["moemail_api_key"] = ""
+			out["api_key"] = ""
+		}
+		out["moemail_base_url"] = ""
+		out["base_url"] = ""
+	case "cfmail":
+		if k := strings.TrimSpace(stringValue(out["cfmail_api_key"])); k != "" {
+			out["moemail_api_key"] = k
+			out["api_key"] = k
+		}
+		if u := strings.TrimSpace(stringValue(out["cfmail_base_url"])); u != "" {
+			out["moemail_base_url"] = u
+			out["base_url"] = u
+		} else if u := strings.TrimSpace(stringValue(out["base_url"])); u != "" {
+			out["moemail_base_url"] = u
+			out["cfmail_base_url"] = u
+		}
+	default: // moemail
+		if k := strings.TrimSpace(stringValue(out["moemail_api_key"])); k != "" {
+			// Drop foreign shapes that slipped past load sanitize.
+			if !mailSecretFitsSlot("moemail_api_key", k) {
+				out["moemail_api_key"] = ""
+				k = ""
+			} else {
+				out["api_key"] = k
+			}
+		}
+		if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" {
+			if k := strings.TrimSpace(stringValue(out["api_key"])); k != "" && mailSecretFitsSlot("moemail_api_key", k) {
+				out["moemail_api_key"] = k
+			}
+		}
+		if u := strings.TrimSpace(stringValue(out["moemail_base_url"])); u != "" {
+			out["base_url"] = u
+		} else if u := strings.TrimSpace(stringValue(out["base_url"])); u != "" {
+			out["moemail_base_url"] = u
 		}
 	}
 	return out
@@ -3933,6 +4631,17 @@ func normalizeRegistrationConfig(raw map[string]any) map[string]any {
 	}
 	// defaults
 	if strings.TrimSpace(stringValue(cfg["mail_provider"])) == "" {
+		cfg["mail_provider"] = "moemail"
+	}
+	// Normalize known provider aliases.
+	switch strings.ToLower(strings.TrimSpace(stringValue(cfg["mail_provider"]))) {
+	case "yyds", "yydsmail", "yyds_mail", "vip215", "215", "maliapi":
+		cfg["mail_provider"] = "yyds"
+	case "gptmail", "gpt-mail", "chatgpt", "chatgptmail", "mail.chatgpt.org.uk":
+		cfg["mail_provider"] = "gptmail"
+	case "cfmail", "cf-mail", "cloudflare", "cloudflare_temp":
+		cfg["mail_provider"] = "cfmail"
+	case "moemail", "moe", "moe-mail":
 		cfg["mail_provider"] = "moemail"
 	}
 	provider := strings.ToLower(strings.TrimSpace(stringValue(cfg["captcha_provider"])))
@@ -4346,12 +5055,18 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 	if body == nil {
 		body = map[string]any{}
 	}
+	// Keep the raw request so durable per-provider slots can be persisted without
+	// adapter remaps (e.g. YYDS key mirrored into moemail_api_key).
+	reqBody := cloneMapAny(body)
 	// Merge non-empty request overrides onto durable registration_config so
 	// empty form fields still use last-saved mail/captcha/proxy secrets.
 	body = mergeRegistrationStartBody(r.Context(), options, body)
-	// Auto-persist last-used config (secrets only when newly provided).
+	// Auto-persist last-used config WITHOUT writing adapter remaps into DB.
+	// Writing remapped moemail_api_key permanently polluted MoeMail with AC-* keys
+	// and cleared moemail_base_url → "MoeMail create failed 401 无效的 API Key".
 	if options.Store != nil {
-		if _, err := saveRegistrationConfig(r.Context(), options, body, false); err != nil {
+		persist := registrationConfigPatchForPersist(reqBody, body)
+		if _, err := saveRegistrationConfig(r.Context(), options, persist, false); err != nil {
 			// non-fatal: registration can still start with merged body
 		}
 	}
@@ -4549,7 +5264,7 @@ func serveUsageEvents(w http.ResponseWriter, r *http.Request, options Options) {
 		okFlag = &v
 	}
 	payload, err := options.Store.UsageEvents(r.Context(), intQuery(query.Get("page"), 1), intQuery(query.Get("page_size"), 50), map[string]string{
-		"q": query.Get("q"), "api_key_id": query.Get("api_key_id"), "account_id": query.Get("account_id"), "model": query.Get("model"), "protocol": query.Get("protocol"), "client_ip": query.Get("client_ip"),
+		"q": query.Get("q"), "api_key_id": query.Get("api_key_id"), "account_id": query.Get("account_id"), "model": query.Get("model"), "protocol": query.Get("protocol"), "client_ip": query.Get("client_ip"), "stream": query.Get("stream"),
 	}, okFlag)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
@@ -5048,6 +5763,43 @@ func serveAdminProbeBatch(w http.ResponseWriter, r *http.Request, options Option
 		}
 		out = append(out, item)
 	}
+	// 新账号批量测活：对尚无 last_quota 的账号补拉类型 + 额度（最多 25，落库）。
+	attachQuotasAfterProbeBatch(r.Context(), options, out)
+	// Quota fetch can race-mark free exhaust and cool; undo for probes that passed.
+	if options.Store != nil {
+		for _, item := range out {
+			if item == nil {
+				continue
+			}
+			ok := item["ok"] == true
+			if res, _ := item["result"].(map[string]any); res != nil {
+				if res["ok"] == true || res["available"] == true {
+					ok = true
+				}
+			}
+			if !ok {
+				continue
+			}
+			aid := strings.TrimSpace(stringValue(item["account_id"]))
+			if aid == "" {
+				continue
+			}
+			if _, err := options.Store.ClearAccountCooldown(r.Context(), aid); err == nil {
+				if pool, _ := item["pool"].(map[string]any); pool != nil {
+					pool["pool_status"] = "normal"
+					pool["in_cooldown"] = false
+					pool["cooldown_until"] = nil
+					pool["cooldown_code"] = nil
+					pool["cooldown_reason"] = nil
+				}
+				if q, _ := item["quota"].(map[string]any); q != nil {
+					q["exhausted"] = false
+					q["auto_disabled"] = false
+					q["in_cooldown"] = false
+				}
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": out, "count": len(out)})
 }
 
@@ -5321,7 +6073,8 @@ func serveExportAccountsSSO(w http.ResponseWriter, r *http.Request, options Opti
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, buildSSOExport(authMap))
+	includePassword := truthy(r.URL.Query().Get("include_password"))
+	writeJSON(w, http.StatusOK, buildSSOExport(authMap, includePassword))
 }
 
 func serveExportAccountsSSOSelected(w http.ResponseWriter, r *http.Request, options Options) {
@@ -5335,12 +6088,353 @@ func serveExportAccountsSSOSelected(w http.ResponseWriter, r *http.Request, opti
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ids := stringSlice(body["ids"])
+	includePassword := truthyAny(body["include_password"])
 	authMap, err := options.Store.ExportAuthMap(r.Context(), ids, true)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, buildSSOExport(authMap))
+	writeJSON(w, http.StatusOK, buildSSOExport(authMap, includePassword))
+}
+
+// serveExportRegistrationSSO exports SSO cookies from live registration sessions
+// and/or durable account payloads (v1.9.78 / v1.9.81 Python parity).
+// Admin UI: POST /accounts/register-email/export-sso under the SSO import panel.
+func serveExportRegistrationSSO(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+
+	// Collect filters from query (GET) and/or JSON body (POST). Body wins on conflict.
+	q := r.URL.Query()
+	fmtName := strings.TrimSpace(strings.ToLower(q.Get("format")))
+	if fmtName == "" {
+		fmtName = "sso"
+	}
+	batchID := strings.TrimSpace(q.Get("batch_id"))
+	includePassword := truthy(q.Get("include_password"))
+	download := truthy(q.Get("download"))
+	if r.Method == http.MethodGet && q.Get("download") == "" {
+		download = true // Python GET default download=1
+	}
+	wantStatus := map[string]struct{}{}
+	for _, part := range strings.Split(q.Get("status"), ",") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		if part != "" {
+			wantStatus[part] = struct{}{}
+		}
+	}
+	wantIDs := map[string]struct{}{}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		var body map[string]any
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+			return
+		}
+		if body != nil {
+			if v := strings.TrimSpace(strings.ToLower(stringValue(body["format"]))); v != "" {
+				fmtName = v
+			}
+			if v := strings.TrimSpace(stringValue(body["batch_id"])); v != "" {
+				batchID = v
+			}
+			if _, ok := body["include_password"]; ok {
+				includePassword = truthyAny(body["include_password"])
+			}
+			if _, ok := body["download"]; ok {
+				download = truthyAny(body["download"])
+			}
+			for _, s := range stringSlice(body["status"]) {
+				s = strings.TrimSpace(strings.ToLower(s))
+				if s != "" {
+					wantStatus[s] = struct{}{}
+				}
+			}
+			for _, id := range stringSlice(body["session_ids"]) {
+				id = strings.TrimSpace(id)
+				if id != "" {
+					wantIDs[id] = struct{}{}
+				}
+			}
+			// Also accept ids as alias for session_ids.
+			for _, id := range stringSlice(body["ids"]) {
+				id = strings.TrimSpace(id)
+				if id != "" {
+					wantIDs[id] = struct{}{}
+				}
+			}
+		}
+	}
+	switch fmtName {
+	case "sso", "cookie", "email_sso", "email_password_sso", "json":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "unsupported format: " + fmtName})
+		return
+	}
+	if fmtName == "email_password_sso" {
+		includePassword = true
+	}
+
+	type ssoRow struct {
+		ID        string
+		AccountID string
+		BatchID   any
+		Status    any
+		Email     string
+		Password  string
+		SSO       string
+		Source    string
+	}
+	rows := make([]ssoRow, 0, 64)
+
+	// 1) Live registration sessions (optional — service may be down/unconfigured).
+	if client := registrationClient(options); client != nil {
+		if payload, err := client.Sessions(r.Context()); err == nil && payload != nil {
+			var sessions []any
+			switch v := payload["sessions"].(type) {
+			case []any:
+				sessions = v
+			case []map[string]any:
+				sessions = make([]any, len(v))
+				for i, m := range v {
+					sessions[i] = m
+				}
+			}
+			for _, raw := range sessions {
+				sess, _ := raw.(map[string]any)
+				if sess == nil {
+					continue
+				}
+				sid := strings.TrimSpace(stringValue(sess["id"]))
+				if len(wantIDs) > 0 {
+					if _, ok := wantIDs[sid]; !ok {
+						continue
+					}
+				}
+				if batchID != "" && strings.TrimSpace(stringValue(sess["batch_id"])) != batchID {
+					continue
+				}
+				st := strings.TrimSpace(strings.ToLower(stringValue(sess["status"])))
+				if len(wantStatus) > 0 {
+					if _, ok := wantStatus[st]; !ok {
+						continue
+					}
+				}
+				sso := strings.TrimSpace(stringValue(sess["sso"]))
+				if sso == "" {
+					if cookies, ok := sess["session_cookies"].(map[string]any); ok {
+						sso = strings.TrimSpace(firstNonEmpty(stringValue(cookies["sso"]), stringValue(cookies["sso-rw"])))
+					}
+				}
+				if sso == "" {
+					// Also try accounts.GetSSOValue on the session map.
+					sso = accounts.GetSSOValue(sess)
+				}
+				if sso == "" {
+					continue
+				}
+				email := strings.TrimSpace(stringValue(sess["email"]))
+				password := strings.TrimSpace(stringValue(sess["password"]))
+				if !includePassword {
+					password = ""
+				}
+				rows = append(rows, ssoRow{
+					ID: sid, BatchID: sess["batch_id"], Status: sess["status"],
+					Email: email, Password: password, SSO: sso, Source: "session",
+				})
+			}
+		}
+	}
+
+	// 2) Durable account store fallback / supplement (survives session expiry).
+	if options.Store != nil {
+		if authMap, err := options.Store.ExportAuthMap(r.Context(), nil, true); err == nil {
+			auth, _ := authMap["auth"].(map[string]any)
+			for aid, raw := range auth {
+				entry, _ := raw.(map[string]any)
+				if entry == nil {
+					continue
+				}
+				sso := accounts.GetSSOValue(entry)
+				if sso == "" {
+					continue
+				}
+				if len(wantIDs) > 0 {
+					sidHit := strings.TrimSpace(stringValue(entry["registration_session_id"]))
+					if _, okID := wantIDs[aid]; !okID {
+						if _, okSess := wantIDs[sidHit]; !okSess {
+							continue
+						}
+					}
+				}
+				if batchID != "" {
+					bid := strings.TrimSpace(stringValue(entry["registration_batch_id"]))
+					if bid != "" && bid != batchID {
+						continue
+					}
+					// Accounts without batch id are only included when no batch filter
+					// was set; with filter, skip empty bid (stricter match).
+					if bid == "" {
+						continue
+					}
+				}
+				if len(wantStatus) > 0 {
+					// Account-store SSO is always from completed imports.
+					_, okDone := wantStatus["done"]
+					_, okImported := wantStatus["imported"]
+					if !okDone && !okImported {
+						continue
+					}
+				}
+				email := strings.TrimSpace(stringValue(entry["email"]))
+				password := strings.TrimSpace(firstNonEmpty(stringValue(entry["password"]), stringValue(entry["register_password"])))
+				if !includePassword {
+					password = ""
+				}
+				rows = append(rows, ssoRow{
+					ID:        firstNonEmpty(strings.TrimSpace(stringValue(entry["registration_session_id"])), aid),
+					AccountID: aid,
+					BatchID:   entry["registration_batch_id"],
+					Status:    "imported",
+					Email:     email,
+					Password:  password,
+					SSO:       sso,
+					Source:    "account",
+				})
+			}
+		}
+	}
+
+	if len(rows) == 0 {
+		// Business "nothing to export" — not a missing route. Return 200 so the
+		// admin UI can show a clear empty state instead of treating it as 404.
+		tsEmpty := time.Now().Format("20060102-150405")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":          false,
+			"count":       0,
+			"matched":     0,
+			"format":      fmtName,
+			"batch_id":    nullIfEmpty(batchID),
+			"exported_at": tsEmpty,
+			"text":        "",
+			"content":     "",
+			"lines":       []string{},
+			"items":       []any{},
+			"detail":      "no registration sessions or accounts with SSO cookie matched filters",
+		})
+		return
+	}
+
+	// De-dupe by sso value, keep first row.
+	seen := map[string]struct{}{}
+	unique := make([]ssoRow, 0, len(rows))
+	for _, row := range rows {
+		key := row.SSO
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, row)
+	}
+
+	ts := time.Now().Format("20060102-150405")
+	if fmtName == "json" {
+		items := make([]map[string]any, 0, len(unique))
+		for _, row := range unique {
+			item := map[string]any{
+				"id": row.ID, "status": row.Status, "email": row.Email,
+				"sso": row.SSO, "source": row.Source, "batch_id": row.BatchID,
+			}
+			if row.AccountID != "" {
+				item["account_id"] = row.AccountID
+			}
+			if includePassword {
+				item["password"] = row.Password
+			}
+			items = append(items, item)
+		}
+		payload := map[string]any{
+			"ok": true, "count": len(unique), "matched": len(rows),
+			"format": fmtName, "batch_id": nullIfEmpty(batchID),
+			"exported_at": ts, "items": items,
+		}
+		if download {
+			raw, _ := json.MarshalIndent(payload, "", "  ")
+			filename := "grok2api-sso-export-" + ts + ".json"
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+			w.Header().Set("X-Export-Count", strconv.Itoa(len(unique)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(raw)
+			return
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+
+	lines := make([]string, 0, len(unique))
+	for _, row := range unique {
+		switch fmtName {
+		case "cookie":
+			lines = append(lines, "sso="+row.SSO)
+		case "email_sso":
+			if row.Email != "" {
+				lines = append(lines, row.Email+"\t"+row.SSO)
+			} else {
+				lines = append(lines, row.SSO)
+			}
+		case "email_password_sso":
+			if row.Email != "" && row.Password != "" {
+				lines = append(lines, row.Email+":"+row.Password+":"+row.SSO)
+			} else if row.Email != "" {
+				lines = append(lines, row.Email+"::"+row.SSO)
+			} else {
+				lines = append(lines, row.SSO)
+			}
+		default: // sso raw
+			lines = append(lines, row.SSO)
+		}
+	}
+	textBody := strings.Join(lines, "\n")
+	if textBody != "" {
+		textBody += "\n"
+	}
+	filename := "grok2api-sso-export-" + ts + ".txt"
+	if download {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+		w.Header().Set("X-Export-Count", strconv.Itoa(len(unique)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(textBody))
+		return
+	}
+	// Redacted preview items for JSON response (full sso stays in text/lines).
+	preview := make([]map[string]any, 0, len(unique))
+	for _, row := range unique {
+		ssoPrev := row.SSO
+		if len(ssoPrev) > 24 {
+			ssoPrev = ssoPrev[:24] + "..."
+		}
+		preview = append(preview, map[string]any{
+			"email": row.Email, "status": row.Status, "sso": ssoPrev, "source": row.Source,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "count": len(unique), "matched": len(rows),
+		"format": fmtName, "batch_id": nullIfEmpty(batchID),
+		"exported_at": ts, "text": textBody, "content": textBody,
+		"lines": lines, "items": preview, "filename": filename,
+	})
+}
+
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
 }
 
 func serveAdminImportFile(w http.ResponseWriter, r *http.Request, options Options) {
@@ -5466,6 +6560,10 @@ func serveAdminImportFiles(w http.ResponseWriter, r *http.Request, options Optio
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
 	}
+	// Heal free-usage rows that were mis-tagged as model_blocked (cooldown fix).
+	if n, rerr := options.Store.RepairFreeUsageModelBlocks(r.Context()); rerr == nil && n > 0 {
+		result["cooldown_repaired"] = n
+	}
 	result["files"] = len(files)
 	result["parse_errors"] = parseErrors
 	result["file_results"] = fileResults
@@ -5488,6 +6586,158 @@ func serveAdminNormalizeAccounts(w http.ResponseWriter, r *http.Request, options
 	writeJSON(w, http.StatusOK, result)
 }
 
+// fetchUpstreamModels pulls /models from xAI using a live account token.
+// Does NOT write the database — callers preview or save separately.
+func fetchUpstreamModels(ctx context.Context, options Options) (items []map[string]any, viaEmail string, origin string, err error) {
+	if options.Store == nil {
+		return nil, "", "", errors.New("store unavailable")
+	}
+	authList, err := options.Store.ListAccountAuths(ctx, 20, true)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if len(authList) == 0 {
+		return nil, "", "", errors.New("no live account for models fetch")
+	}
+	a := authList[0]
+	origin = strings.TrimRight(options.Config.UpstreamBase, "/") + "/models"
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin, nil)
+	if err != nil {
+		return nil, "", origin, err
+	}
+	gc := upstreamClient(options)
+	for k, v := range gc.Headers(a.Token, options.runtimeConfig().DefaultModel) {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, a.Email, origin, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= 400 {
+		return nil, a.Email, origin, fmt.Errorf("upstream %d: %s", resp.StatusCode, string(body)[:minInt(300, len(body))])
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, a.Email, origin, fmt.Errorf("parse: %w", err)
+	}
+	items = parseUpstreamModels(payload)
+	// Always keep local extras (coding/build/search aliases) even when upstream list is tiny.
+	items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
+	if len(items) == 0 {
+		return nil, a.Email, origin, errors.New("no models in upstream response")
+	}
+	return items, a.Email, origin, nil
+}
+
+// serveAdminModelsFetch: 仅从上游获取模型列表（预览，不写库）。
+func serveAdminModelsFetch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	items, via, origin, err := fetchUpstreamModels(r.Context(), options)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"preview":        true,
+		"saved":          false,
+		"count":          len(items),
+		"upstream_count": len(items),
+		"fetched_via":    via,
+		"origin":         origin,
+		"models":         items,
+		"data":           items,
+		"default_model":  options.runtimeConfig().DefaultModel,
+		"message":        fmt.Sprintf("已从上游获取 %d 个模型（未写入数据库，请点「保存到数据库」）", len(items)),
+	})
+}
+
+// serveAdminModelsSave: 将预览列表或请求体中的模型目录写入 PostgreSQL。
+func serveAdminModelsSave(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	if options.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&body)
+	if body == nil {
+		body = map[string]any{}
+	}
+	var items []map[string]any
+	// Prefer explicit list from client preview.
+	if raw, ok := body["models"].([]any); ok && len(raw) > 0 {
+		for _, it := range raw {
+			if m, ok := it.(map[string]any); ok {
+				items = append(items, m)
+			}
+		}
+	} else if raw, ok := body["data"].([]any); ok && len(raw) > 0 {
+		for _, it := range raw {
+			if m, ok := it.(map[string]any); ok {
+				items = append(items, m)
+			}
+		}
+	}
+	via := strings.TrimSpace(stringValue(body["fetched_via"]))
+	origin := strings.TrimSpace(stringValue(body["origin"]))
+	// Empty body → re-fetch from upstream then save (convenience).
+	if len(items) == 0 {
+		fetched, email, org, err := fetchUpstreamModels(r.Context(), options)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		items = fetched
+		if via == "" {
+			via = email
+		}
+		if origin == "" {
+			origin = org
+		}
+	}
+	items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
+	if len(items) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "no models to save"})
+		return
+	}
+	meta := map[string]any{
+		"source":      "admin_save",
+		"fetched_via": via,
+		"origin":      origin,
+		"saved_at":    time.Now().Unix(),
+	}
+	n, err := options.Store.ReplaceModels(r.Context(), items, meta)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	catalog := modelCatalog(options).PublicModels(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"saved":          true,
+		"preview":        false,
+		"count":          len(catalog),
+		"pg_count":       n,
+		"upstream_count": len(items),
+		"fetched_via":    via,
+		"origin":         origin,
+		"storage":        "postgres",
+		"models":         catalog,
+		"data":           catalog,
+		"default_model":  options.runtimeConfig().DefaultModel,
+		"message":        fmt.Sprintf("已保存 %d 个模型到数据库", n),
+	})
+}
+
+// serveAdminModelsSync: 一键获取并写入数据库（兼容旧 UI）。
 func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Options) {
 	if !requireAdminReadWrite(w, r, options, true) {
 		return
@@ -5496,55 +6746,256 @@ func serveAdminModelsSync(w http.ResponseWriter, r *http.Request, options Option
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "store unavailable"})
 		return
 	}
-	authList, err := options.Store.ListAccountAuths(r.Context(), 20, true)
-	if err != nil || len(authList) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "no live account for models sync"})
-		return
-	}
-	a := authList[0]
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(options.Config.UpstreamBase, "/")+"/models", nil)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
-		return
-	}
-	gc := upstreamClient(options)
-	for k, v := range gc.Headers(a.Token, options.runtimeConfig().DefaultModel) {
-		req.Header.Set(k, v)
-	}
-	resp, err := client.Do(req)
+	items, via, origin, err := fetchUpstreamModels(r.Context(), options)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode >= 400 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": fmt.Sprintf("upstream %d: %s", resp.StatusCode, string(body)[:minInt(300, len(body))])})
-		return
-	}
-	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "parse: " + err.Error()})
-		return
-	}
-	items := parseUpstreamModels(payload)
-	// Always keep local extras (coding/build/search aliases) even when upstream list is tiny.
-	items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
-	if len(items) == 0 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": "no models in upstream response"})
-		return
-	}
-	n, err := options.Store.ReplaceModels(r.Context(), items, map[string]any{"source": "upstream", "fetched_via": a.Email, "origin": strings.TrimRight(options.Config.UpstreamBase, "/") + "/models"})
+	n, err := options.Store.ReplaceModels(r.Context(), items, map[string]any{
+		"source": "upstream", "fetched_via": via, "origin": origin,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	catalog := modelCatalog(options).PublicModels(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "count": len(catalog), "pg_count": n, "upstream_count": n,
-		"fetched_via": a.Email, "storage": "postgres", "models": catalog, "data": catalog,
+		"ok": true, "saved": true, "count": len(catalog), "pg_count": n, "upstream_count": len(items),
+		"fetched_via": via, "origin": origin, "storage": "postgres", "models": catalog, "data": catalog,
+		"message": fmt.Sprintf("已同步并保存 %d 个模型到数据库", n),
 	})
+}
+
+// attachQuotaAfterProbe live-fetches account type + quota usage and merges into
+// the probe pool view so 新导入/测活账号 immediately show Free/SuperGrok + usage.
+// FetchOne already persists last_quota asynchronously (merge-safe with prior snap).
+// Returns the quota item (may be nil) for the JSON response body.
+func attachQuotaAfterProbe(ctx context.Context, options Options, accountID string, poolView map[string]any) map[string]any {
+	accountID = strings.TrimSpace(accountID)
+	if options.Quota == nil || accountID == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Bound billing+token probe so a slow upstream cannot pin the admin click forever.
+	qctx, cancel := context.WithTimeout(ctx, 22*time.Second)
+	defer cancel()
+	item, err := options.Quota.FetchOne(qctx, accountID)
+	if err != nil || item == nil {
+		return nil
+	}
+	// Model probe already proved the account is live. A follow-up free-token probe
+	// can race-report exhausted=0 remaining and cool the account out of rotation.
+	// Undo that cool so freshly registered / just-probed accounts stay 轮询中.
+	probeOK := false
+	if poolView != nil {
+		if poolView["pool_status"] == "normal" || poolView["last_probe_status"] == "ok" {
+			probeOK = true
+		}
+		if lp, _ := poolView["last_probe"].(map[string]any); lp != nil {
+			if lp["ok"] == true || lp["available"] == true {
+				probeOK = true
+			}
+		}
+	}
+	if probeOK && options.Store != nil {
+		if item["exhausted"] == true || item["auto_disabled"] == true {
+			// Keep usage numbers for UI, but clear false exhaust cool.
+			item["exhausted"] = false
+			item["auto_disabled"] = false
+			delete(item, "exhaust_reason")
+			item["in_cooldown"] = false
+			if p, _ := item["pool"].(map[string]any); p != nil {
+				p["pool_status"] = "normal"
+				p["in_cooldown"] = false
+			}
+		}
+		if _, err := options.Store.ClearAccountCooldown(qctx, accountID); err == nil {
+			// re-enter rotation
+		}
+	}
+	// Strip nested pool from quota item before embedding (cycle risk / noise).
+	quotaSnap := make(map[string]any, len(item))
+	for k, v := range item {
+		if k == "pool" {
+			continue
+		}
+		quotaSnap[k] = v
+	}
+	if poolView != nil {
+		poolView["last_quota"] = quotaSnap
+		// Promote type onto pool for list paint convenience.
+		if at := strings.TrimSpace(fmt.Sprint(quotaSnap["account_type"])); at != "" && at != "<nil>" {
+			poolView["account_type"] = at
+			poolView["plan"] = at
+		}
+		if pl := strings.TrimSpace(fmt.Sprint(quotaSnap["plan_label"])); pl != "" && pl != "<nil>" {
+			poolView["plan_label"] = pl
+		}
+		// IMPORTANT: do NOT paint cooldown from a concurrent quota fetch when model
+		// probe just succeeded. Fresh free accounts often get a false "exhausted"
+		// from a secondary token probe / header race; kicking them out of rotation
+		// after a green 测活 is wrong. Only surface cool when probe already failed
+		// or pool was already cool and quota independently confirms exhaust.
+		probeOK := poolView["pool_status"] == "normal" || poolView["last_probe_status"] == "ok"
+		if !probeOK && (quotaSnap["exhausted"] == true || quotaSnap["auto_disabled"] == true) {
+			if poolView["in_cooldown"] != true {
+				poolView["in_cooldown"] = true
+				if ps, _ := poolView["pool_status"].(string); ps == "" || ps == "normal" {
+					poolView["pool_status"] = "cooldown"
+				}
+			}
+		}
+	}
+	return quotaSnap
+}
+
+// attachQuotasAfterProbeBatch fills missing last_quota for a probe-batch result set.
+// Caps live fetches to 25 (same as FetchByIDs) — large batches rely on auto-refresh.
+func attachQuotasAfterProbeBatch(ctx context.Context, options Options, results []map[string]any) {
+	if len(results) == 0 {
+		return
+	}
+	// Prefer accounts with no durable last_quota yet (newly imported).
+	need := make([]string, 0, len(results))
+	seen := map[string]struct{}{}
+	for _, item := range results {
+		if item == nil {
+			continue
+		}
+		aid := strings.TrimSpace(stringValue(item["account_id"]))
+		if aid == "" {
+			continue
+		}
+		pool, _ := item["pool"].(map[string]any)
+		if pool == nil {
+			pool = map[string]any{}
+			item["pool"] = pool
+		}
+		lq, _ := pool["last_quota"].(map[string]any)
+		if len(lq) > 0 {
+			// Already has durable snap — still promote type for UI if present.
+			if at := strings.TrimSpace(fmt.Sprint(lq["account_type"])); at != "" && at != "<nil>" {
+				item["account_type"] = at
+				item["plan"] = at
+			}
+			if pl := strings.TrimSpace(fmt.Sprint(lq["plan_label"])); pl != "" && pl != "<nil>" {
+				item["plan_label"] = pl
+			}
+			continue
+		}
+		if options.Quota == nil {
+			continue
+		}
+		if _, ok := seen[aid]; ok {
+			continue
+		}
+		seen[aid] = struct{}{}
+		need = append(need, aid)
+		if len(need) >= 25 {
+			break
+		}
+	}
+	if options.Quota == nil || len(need) == 0 {
+		return
+	}
+	qctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	out, err := options.Quota.FetchByIDs(qctx, need)
+	if err != nil || out == nil {
+		// Fallback: sequential FetchOne for a couple of ids only.
+		for i, aid := range need {
+			if i >= 5 {
+				break
+			}
+			snap := attachQuotaAfterProbe(qctx, options, aid, nil)
+			if snap == nil {
+				continue
+			}
+			for _, item := range results {
+				if strings.TrimSpace(stringValue(item["account_id"])) != aid {
+					continue
+				}
+				pool, _ := item["pool"].(map[string]any)
+				if pool == nil {
+					pool = map[string]any{}
+					item["pool"] = pool
+				}
+				pool["last_quota"] = snap
+				item["quota"] = snap
+				if at := strings.TrimSpace(fmt.Sprint(snap["account_type"])); at != "" && at != "<nil>" {
+					item["account_type"] = at
+					item["plan"] = at
+					pool["account_type"] = at
+				}
+			}
+		}
+		return
+	}
+	rows, _ := out["results"].([]map[string]any)
+	if rows == nil {
+		if arr, ok := out["results"].([]any); ok {
+			for _, raw := range arr {
+				if m, ok := raw.(map[string]any); ok {
+					rows = append(rows, m)
+				}
+			}
+		}
+		if rows == nil {
+			if arr, ok := out["accounts"].([]map[string]any); ok {
+				rows = arr
+			}
+		}
+	}
+	byID := map[string]map[string]any{}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		id := strings.TrimSpace(stringValue(row["account_id"]))
+		if id == "" {
+			id = strings.TrimSpace(stringValue(row["id"]))
+		}
+		if id == "" {
+			continue
+		}
+		snap := make(map[string]any, len(row))
+		for k, v := range row {
+			if k == "pool" {
+				continue
+			}
+			snap[k] = v
+		}
+		byID[id] = snap
+	}
+	for _, item := range results {
+		if item == nil {
+			continue
+		}
+		aid := strings.TrimSpace(stringValue(item["account_id"]))
+		snap := byID[aid]
+		if snap == nil {
+			continue
+		}
+		pool, _ := item["pool"].(map[string]any)
+		if pool == nil {
+			pool = map[string]any{}
+			item["pool"] = pool
+		}
+		pool["last_quota"] = snap
+		item["quota"] = snap
+		if at := strings.TrimSpace(fmt.Sprint(snap["account_type"])); at != "" && at != "<nil>" {
+			item["account_type"] = at
+			item["plan"] = at
+			pool["account_type"] = at
+			pool["plan"] = at
+		}
+		if pl := strings.TrimSpace(fmt.Sprint(snap["plan_label"])); pl != "" && pl != "<nil>" {
+			item["plan_label"] = pl
+			pool["plan_label"] = pl
+		}
+	}
 }
 
 func serveAdminAccountsQuota(w http.ResponseWriter, r *http.Request, options Options) {
@@ -5567,7 +7018,30 @@ func serveAdminAccountsQuota(w http.ResponseWriter, r *http.Request, options Opt
 	}
 	cached := r.URL.Query().Get("cached") == "1" || r.URL.Query().Get("cached") == "true"
 	refresh := r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true"
-	if cached && !refresh {
+	// Optional scope: only probe these account ids (visible page / missing quota).
+	// Avoids multi-thousand full-pool stampede when UI only needs current page.
+	idsParam := strings.TrimSpace(r.URL.Query().Get("ids"))
+	var scopeIDs []string
+	if idsParam != "" {
+		for _, part := range strings.Split(idsParam, ",") {
+			id := strings.TrimSpace(part)
+			if id != "" {
+				scopeIDs = append(scopeIDs, id)
+			}
+		}
+	}
+	if len(scopeIDs) == 0 {
+		// Also accept repeated ?id= / form style.
+		if vals := r.URL.Query()["id"]; len(vals) > 0 {
+			for _, v := range vals {
+				id := strings.TrimSpace(v)
+				if id != "" {
+					scopeIDs = append(scopeIDs, id)
+				}
+			}
+		}
+	}
+	if cached && !refresh && len(scopeIDs) == 0 {
 		out, err := options.Quota.FetchCached(r.Context())
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
@@ -5576,7 +7050,15 @@ func serveAdminAccountsQuota(w http.ResponseWriter, r *http.Request, options Opt
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	out, err := options.Quota.FetchAll(r.Context())
+	var (
+		out map[string]any
+		err error
+	)
+	if len(scopeIDs) > 0 {
+		out, err = options.Quota.FetchByIDs(r.Context(), scopeIDs)
+	} else {
+		out, err = options.Quota.FetchAll(r.Context())
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
@@ -5654,15 +7136,21 @@ func serveAdminAccountQuota(w http.ResponseWriter, r *http.Request, options Opti
 				item[k] = v
 			}
 		}
-		// If DB already has the quota write, prefer its pool_status.
-		if v, ok := poolView["pool_status"].(string); ok && v == "quota_disabled" {
+		// Prefer cooldown (new) over legacy permanent quota_disabled from DB.
+		if v, ok := poolView["pool_status"].(string); ok && (v == "cooldown" || v == "quota_disabled") {
+			if v == "quota_disabled" {
+				// Legacy rows: present as cooldown until next healthy snapshot clears them.
+				v = "cooldown"
+			}
 			synth["pool_status"] = v
-			synth["disabled_for_quota"] = true
-			synth["enabled"] = false
+			synth["disabled_for_quota"] = false
+			synth["enabled"] = true
+			synth["in_cooldown"] = true
 			item["pool_status"] = v
-			item["disabled_for_quota"] = true
+			item["disabled_for_quota"] = false
 			item["auto_disabled"] = true
-			item["pool_disabled"] = true
+			item["pool_disabled"] = false
+			item["in_cooldown"] = true
 		}
 	}
 	// Surface top-level fields used by frontend even when only synth pool exists.
@@ -5939,18 +7427,22 @@ func usageDetail(route string, requestBody map[string]any, ttftMS, latency int) 
 	return detail
 }
 
-// extractReasoningEffort normalizes client thinking intensity to low/medium/high/xhigh.
-// Codex: auto/default/standard/extra-high · Claude Code: low/medium/high/xhigh + budget_tokens.
+// extractReasoningEffort returns the client-facing thinking intensity for usage
+// detail: low|medium|high|xhigh|max|ultracode (Claude Code menu + Anthropic API).
+// Upstream still receives low|medium|high via reasoning.ToUpstream / ApplyCanonical.
+// Codex: Low/Base/High/Ultra/Proactive (+ auto/default/standard/extra-high) · Claude: output_config.effort + budget_tokens.
 func extractReasoningEffort(payload map[string]any) string {
 	return reasoning.FromRequest(payload)
 }
 
 func normalizeReasoningEffort(value any) string {
-	return reasoning.Normalize(value)
+	// Client-facing label (for logs / admin). Use reasoning.ToUpstream for Grok.
+	return reasoning.NormalizeClient(value)
 }
 
 func budgetToEffort(n int) string {
-	return reasoning.BudgetToLevel(n)
+	// Client-facing budget mapping (may be xhigh/max).
+	return reasoning.BudgetToClient(n)
 }
 
 func firstNonEmptyStr(values ...string) string {
@@ -6164,11 +7656,11 @@ func serveSub2APIGroupsCreate(w http.ResponseWriter, r *http.Request, options Op
 	writeJSON(w, http.StatusOK, out)
 }
 
-func buildSSOExport(authMap map[string]any) map[string]any {
+func buildSSOExport(authMap map[string]any, includePassword bool) map[string]any {
 	auth, _ := authMap["auth"].(map[string]any)
 	lines := []string{}
 	items := []map[string]any{}
-	includePassword := false
+	hadPassword := false
 	for id, raw := range auth {
 		entry, _ := raw.(map[string]any)
 		if entry == nil {
@@ -6178,30 +7670,26 @@ func buildSSOExport(authMap map[string]any) map[string]any {
 		if sso == "" {
 			continue
 		}
-		email := ""
-		if v, ok := entry["email"].(string); ok {
-			email = strings.TrimSpace(v)
-		}
-		password := ""
-		if v, ok := entry["password"].(string); ok {
-			password = strings.TrimSpace(v)
-		}
-		if password == "" {
-			if v, ok := entry["register_password"].(string); ok {
-				password = strings.TrimSpace(v)
-			}
-		}
+		email := strings.TrimSpace(stringValue(entry["email"]))
+		password := strings.TrimSpace(firstNonEmpty(stringValue(entry["password"]), stringValue(entry["register_password"])))
 		line := sso
-		if email != "" && password != "" {
+		if includePassword && email != "" && password != "" {
 			line = email + "----" + sso + "----" + password
-			includePassword = true
+			hadPassword = true
 		} else if email != "" {
 			line = email + "----" + sso
 		}
 		lines = append(lines, line)
-		items = append(items, map[string]any{"id": id, "email": email, "sso": sso})
+		item := map[string]any{"id": id, "email": email, "sso": sso}
+		if includePassword && password != "" {
+			item["password"] = password
+		}
+		items = append(items, item)
 	}
 	content := strings.Join(lines, "\n")
+	if content != "" {
+		content += "\n"
+	}
 	return map[string]any{
 		"ok":               true,
 		"count":            len(items),
@@ -6214,7 +7702,7 @@ func buildSSOExport(authMap map[string]any) map[string]any {
 		"ext":              "txt",
 		"media_type":       "text/plain;charset=utf-8",
 		"filename":         "grok2api-accounts-sso.txt",
-		"include_password": includePassword,
+		"include_password": hadPassword || includePassword,
 	}
 }
 
@@ -6343,10 +7831,24 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 		} else {
 			touchRedisPool(options, aid, false, errText, nil, statusCode)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		// 测活同时拉账号类型 + 额度使用，写入 last_quota 并回传给管理台。
+		// 新导入账号常无额度缓存；这里补齐 Free/SuperGrok 与 token/美元用量。
+		quotaSnap := attachQuotaAfterProbe(r.Context(), options, aid, poolView)
+		resp := map[string]any{
 			"ok": ok, "account_id": aid, "email": email,
 			"result": result, "pool": poolView,
-		})
+		}
+		if quotaSnap != nil {
+			resp["quota"] = quotaSnap
+			if at := strings.TrimSpace(fmt.Sprint(quotaSnap["account_type"])); at != "" && at != "<nil>" {
+				resp["account_type"] = at
+				resp["plan"] = at
+			}
+			if pl := strings.TrimSpace(fmt.Sprint(quotaSnap["plan_label"])); pl != "" && pl != "<nil>" {
+				resp["plan_label"] = pl
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	// Fallback when ModelHealth is not wired (tests / degraded): still persist last_probe.
@@ -6382,19 +7884,31 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 			if status == 401 || status == 403 {
 				_, _ = options.Store.SetAccountEnabled(r.Context(), auth.ID, false)
 				result["auto_disabled"] = true
-			} else if decision.ShouldCooldown {
+			} else if decision.BlockModel {
+				// empty model output etc.: soft-block model only (模型封禁), no account cool.
 				until := time.Now().Add(10 * time.Minute)
 				if decision.Until != nil {
 					until = *decision.Until
 				}
-				if decision.BlockModel {
-					bm := model
-					if decision.Model != "" {
-						bm = decision.Model
+				bm := model
+				if decision.Model != "" {
+					bm = decision.Model
+				}
+				_ = options.Store.BlockPoolModel(r.Context(), auth.ID, bm, &until)
+				result["model_blocked"] = true
+				result["blocked_model"] = bm
+				if decision.ShouldCooldown {
+					sec := until.Sub(time.Now()).Seconds()
+					if sec < 60 {
+						sec = 60
 					}
-					_ = options.Store.BlockPoolModel(r.Context(), auth.ID, bm, &until)
-					result["model_blocked"] = true
-					result["blocked_model"] = bm
+					_, _ = options.Store.KickFromPool(r.Context(), auth.ID, errText, &sec)
+					result["kicked_cooldown"] = true
+				}
+			} else if decision.ShouldCooldown {
+				until := time.Now().Add(10 * time.Minute)
+				if decision.Until != nil {
+					until = *decision.Until
 				}
 				sec := until.Sub(time.Now()).Seconds()
 				if sec < 60 {
@@ -6417,7 +7931,7 @@ func serveAdminProbeAccount(w http.ResponseWriter, r *http.Request, options Opti
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 	_ = resp.Body.Close()
-	_ = options.Store.ReportPoolSuccess(r.Context(), auth.ID, true)
+	_ = options.Store.ReportPoolSuccess(r.Context(), auth.ID, false) /* probe/manual success clears sticky cool */
 	if _, err := options.Store.ClearAccountCooldown(r.Context(), auth.ID); err == nil {
 		result["recovered"] = true
 	}
@@ -6853,8 +8367,19 @@ func clearAdminCookie(w http.ResponseWriter) {
 }
 
 func serveAdminPage(w http.ResponseWriter, r *http.Request, staticDir, page string) {
-	name := strings.TrimSpace(strings.TrimSuffix(page, ".html"))
-	if name == "" {
+	name := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(page, ".html")))
+	// Reject common broken client links (mobile nav used to emit href="undefined"
+	// when PAGE_HREF omitted usage/logs → browser hit /admin/undefined → 404).
+	if name == "" || name == "undefined" || name == "null" {
+		if name == "" {
+			name = "index"
+		} else {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	if name == "overview" {
+		// Alias: menu meta key is "overview", file is admin/index.html.
 		name = "index"
 	}
 	if !allowedAdminPage(name) {
@@ -6866,7 +8391,8 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request, staticDir, page stri
 
 func allowedAdminPage(name string) bool {
 	switch name {
-	case "index", "overview", "login", "keys", "accounts", "models", "guide", "settings", "logs", "usage":
+	// Keep in sync with static/js PAGE_HREF / PAGE_META and static/admin/*.html.
+	case "index", "login", "keys", "accounts", "models", "guide", "settings", "logs", "usage":
 		return true
 	default:
 		return false
@@ -6958,6 +8484,10 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 		status = http.StatusInternalServerError
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// Admin JSON is live state (logs/accounts/status). Never let a CDN or browser
+	// serve a stale task list after a progress upsert ("日志更新不及时").
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {

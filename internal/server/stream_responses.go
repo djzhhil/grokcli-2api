@@ -52,15 +52,53 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 	// pendingText accumulates non-tool frames across tiny upstream deltas so we
 	// do not Flush once per token. Flushed on tools / size / keepalive / end.
 	// Stored as a single byte buffer (not []string) to avoid per-tick joins.
+	//
+	// IMPORTANT: only clear the buffer after full delivery (LastOK). Soft client
+	// blips used to discard the whole payload while lastOK=false, which dropped
+	// mid-turn text/reasoning and surfaced as intermittent incomplete assistant
+	// output. Soft short-writes advance by LastWritten (drop delivered prefix,
+	// keep the tail) so retries neither truncate nor duplicate text.
 	pendingText := make([]byte, 0, textCoalesceMax*2)
 	flushPendingText := func(force bool) error {
 		if len(pendingText) == 0 {
 			return nil
 		}
-		payload := pendingText
-		pendingText = pendingText[:0]
-		streamCoalesceFlush.Add(1)
-		return sw.WriteBytes(payload, force || sw.SoftGone())
+		attempts := 1
+		if force {
+			attempts = 3
+		}
+		var lastErr error
+		for i := 0; i < attempts && len(pendingText) > 0; i++ {
+			if i > 0 {
+				time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+			}
+			payload := pendingText
+			streamCoalesceFlush.Add(1)
+			lastErr = sw.WriteBytes(payload, force || sw.SoftGone())
+			if lastErr != nil {
+				return lastErr
+			}
+			if sw.LastOK() {
+				pendingText = pendingText[:0]
+				streamer.AckContentDelivered()
+				return nil
+			}
+			// Soft fail: drop only the bytes that landed; keep the unsent tail.
+			if n := sw.LastWritten(); n > 0 {
+				if n >= len(pendingText) {
+					pendingText = pendingText[:0]
+				} else {
+					pendingText = append(pendingText[:0], pendingText[n:]...)
+				}
+				if len(pendingText) == 0 {
+					streamer.AckContentDelivered()
+					return nil
+				}
+			}
+		}
+		// Soft-fail with residual: leave pendingText for a later force drain
+		// (tool boundary / idle / Complete) so text is not permanently lost.
+		return nil
 	}
 
 	// emitFrames groups function_call start…done into one Write+Flush (atomic tool
@@ -153,6 +191,10 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 						if isToolGroup {
 							toolsEmitted++
 						}
+					} else if strings.Contains(joined, "response.output_text") ||
+						strings.Contains(joined, "response.reasoning") {
+						// Text/reasoning survived Write+Flush — count as delivered.
+						streamer.AckContentDelivered()
 					}
 					if strings.Contains(joined, "response.completed") || strings.Contains(joined, "[DONE]") {
 						streamer.AckTerminal()
@@ -192,7 +234,8 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 			return nil
 		}
 		if raw, ok := delta.Usage.(map[string]any); ok {
-			usage = raw
+			// Merge partial usage frames (xAI may send incremental then final).
+			usage = mergeUsageMaps(usage, raw)
 		}
 		// Merge reasoning+text+tools from one upstream tick into fewer flushes.
 		// Tools always go through emitFrames (atomic groups); text may coalesce.
@@ -218,8 +261,11 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 			}
 			wroteThisTick = true
 		}
-		// TTFT only after real client payload (not held incomplete tools).
-		if firstTokenMS == 0 && streamer.HasClientPayload() {
+		// TTFT only after a successful Write of real client payload (not frames that
+		// soft-failed and were requeued). HasClientPayload is true as soon as frames
+		// are *produced* — using it alone caused intermittent admin rows with
+		// ttft>0 + empty 502 when the write never landed.
+		if firstTokenMS == 0 && streamer.PayloadDelivered() {
 			firstTokenMS = int(time.Since(started).Milliseconds())
 			if firstTokenMS <= 0 {
 				firstTokenMS = 1
@@ -243,8 +289,14 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 		return sw.Keepalive(kaFrame, DefaultKeepaliveInterval, false)
 	})
 
-	// Drain any coalesced text before terminal Complete.
-	_ = flushPendingText(true)
+	// Drain any coalesced text before terminal Complete. Retry while soft-fail
+	// left bytes in the buffer so mid-turn text is not truncated.
+	for drain := 0; drain < 3 && len(pendingText) > 0; drain++ {
+		_ = flushPendingText(true)
+		if sw.LastOK() && len(pendingText) == 0 {
+			break
+		}
+	}
 
 	clientGone := sw.SoftGone() || errors.Is(err, r.Context().Err()) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftClientWriteError(err)
 	hasPayload := streamer.HasClientPayload() || streamer.HasPendingTools() || streamer.HasUnackedTools()
@@ -254,38 +306,70 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 	if upstreamMidError && !hasPayload {
 		msg, errType := openAIErrorFromCause(err)
 		_ = emitFrames(streamer.Fail(msg, errType), true)
-		return usage, firstTokenMS, err
+		return fillStreamUsage(usage, streamer), firstTokenMS, err
 	}
 	respUsage := responsesUsageFromOpenAI(usage)
 	// Always try to close the Responses envelope so Codex / Claude Code leave "running".
 	if termErr := emitFrames(streamer.Complete(&respUsage), true); termErr != nil && !clientGone && !upstreamMidError {
-		return usage, firstTokenMS, termErr
+		return fillStreamUsage(usage, streamer), firstTokenMS, termErr
 	}
 	// Soft-fail recovery: more Complete rebuilds (tools + completed).
 	for attempt := 0; attempt < 4 && streamer.NeedsFinishRetry(); attempt++ {
 		_ = emitFrames(streamer.Complete(&respUsage), true)
 	}
-	// Empty / half-open: never soft-ok (admin ok=true tokens=0 leak).
+	// True empty: no produced payload at all (and nothing pending/unacked).
 	if !streamer.HasClientPayload() {
 		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		if upstreamMidError && err != nil {
-			return usage, firstTokenMS, err
+			return fillStreamUsage(usage, streamer), firstTokenMS, err
 		}
-		return usage, firstTokenMS, empty
+		return fillStreamUsage(usage, streamer), firstTokenMS, empty
 	}
-	if !streamer.ClientDeliveryOK() {
+	if streamer.ClientDeliveryOK() {
+		if clientGone || upstreamMidError {
+			return fillStreamUsage(usage, streamer), firstTokenMS, nil
+		}
+		return fillStreamUsage(usage, streamer), firstTokenMS, err
+	}
+	// Recovery exhausted. Distinguish:
+	//  1) Half-open tools (emitted, never Ack'd) → real "Tool use interrupted" fail.
+	//  2) Payload already delivered (tools Ack'd / content written) but terminal
+	//     never Ack'd → soft-close. Emitting response.failed after a real tool/text
+	//     delivery is what Claude Code surfaces as intermittent mid-response /
+	//     "Tool use interrupted" with admin ok=false tokens=0 ttft>0.
+	//  3) Everything else (incomplete-only tools dropped) → empty fail.
+	if streamer.HalfOpenTools() {
 		empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
 		if !streamer.TerminalDelivered() {
 			_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
 		}
 		if upstreamMidError && err != nil {
-			return usage, firstTokenMS, err
+			return fillStreamUsage(usage, streamer), firstTokenMS, err
 		}
-		return usage, firstTokenMS, empty
+		return fillStreamUsage(usage, streamer), firstTokenMS, empty
 	}
-	if clientGone || upstreamMidError {
-		return usage, firstTokenMS, nil
+	if streamer.PayloadDelivered() {
+		// Soft-close: client already has usable output. Do not Fail over it.
+		return fillStreamUsage(usage, streamer), firstTokenMS, nil
 	}
-	return usage, firstTokenMS, err
+	empty := errors.New("Upstream returned HTTP 200 with empty model output (no content/tool_calls)")
+	if !streamer.TerminalDelivered() {
+		_ = emitFrames(streamer.Fail("empty model output", "server_error"), true)
+	}
+	if upstreamMidError && err != nil {
+		return fillStreamUsage(usage, streamer), firstTokenMS, err
+	}
+	return fillStreamUsage(usage, streamer), firstTokenMS, empty
+}
+
+// fillStreamUsage patches zero usage from LiveStreamer output when the upstream
+// omitted the final usage frame (common on soft-close / short tool turns).
+func fillStreamUsage(usage map[string]any, streamer *responses.LiveStreamer) map[string]any {
+	hint := 0
+	if streamer != nil {
+		hint = streamer.EstimateOutputTokens()
+	}
+	filled, _ := fillMissingUsage(usage, nil, hint)
+	return filled
 }
