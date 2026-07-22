@@ -811,7 +811,7 @@ func (c *chatCollector) response() map[string]any {
 // preferredShellArgKey resolves the client-facing shell arg name for a tool.
 // Honors an explicit map from the client tool schema when present; otherwise
 // defaults via toolcall.DefaultShellArgKey (Codex "cmd", Hermes terminal "command").
-func preferredShellArgKey(name string, keys map[string]string) string {
+func preferredClientArgKey(name string, keys map[string]string) string {
 	if keys != nil {
 		if v := strings.TrimSpace(keys[name]); v != "" {
 			return v
@@ -824,6 +824,13 @@ func preferredShellArgKey(name string, keys map[string]string) string {
 				return v
 			}
 		}
+	}
+	return ""
+}
+
+func preferredShellArgKey(name string, keys map[string]string) string {
+	if preferred := preferredClientArgKey(name, keys); preferred != "" {
+		return preferred
 	}
 	if toolcall.IsShellTool(name) {
 		return toolcall.DefaultShellArgKey(name)
@@ -1061,12 +1068,14 @@ type ChatToolStreamAssembler struct {
 	// shellArgKeys maps tool name → preferred client shell arg key ("cmd" or "command").
 	// Empty/nil defaults shell-family tools to "cmd" (Codex schema).
 	shellArgKeys map[string]string
+	// pathArgKeys maps tool name → client file path key ("path" or "file_path").
+	pathArgKeys map[string]string
 	// allowedTools: client-registered names for Update/StrReplace → Edit remap.
 	allowedTools []string
 }
 
 func NewChatToolStreamAssembler() *ChatToolStreamAssembler {
-	return &ChatToolStreamAssembler{emitted: map[int]bool{}, clientAcked: map[int]bool{}, shellArgKeys: map[string]string{}}
+	return &ChatToolStreamAssembler{emitted: map[int]bool{}, clientAcked: map[int]bool{}, shellArgKeys: map[string]string{}, pathArgKeys: map[string]string{}}
 }
 
 // SetShellArgKeys configures client-facing shell parameter names (Codex: "cmd").
@@ -1079,6 +1088,18 @@ func (a *ChatToolStreamAssembler) SetShellArgKeys(keys map[string]string) {
 		return
 	}
 	a.shellArgKeys = keys
+}
+
+// SetPathArgKeys configures client-facing path parameter names.
+func (a *ChatToolStreamAssembler) SetPathArgKeys(keys map[string]string) {
+	if a == nil {
+		return
+	}
+	if keys == nil {
+		a.pathArgKeys = map[string]string{}
+		return
+	}
+	a.pathArgKeys = keys
 }
 
 // SetAllowedTools configures client-registered tool names for outbound remap
@@ -1360,6 +1381,12 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 		if a.emitted[idx] && a.clientAcked[idx] {
 			continue
 		}
+		if fn, _ := call["function"].(map[string]any); fn != nil {
+			name := strings.TrimSpace(stringValueAny(fn["name"]))
+			if preferred := preferredClientArgKey(name, a.pathArgKeys); preferred != "" {
+				fn["arguments"] = toolcall.ProjectPathArgsForClient(stringValueAny(fn["arguments"]), preferred)
+			}
+		}
 		// Only emit when force or arguments complete (already filtered by normalize).
 		// Mark framed but not acked — soft write can RequeueUnacked and re-emit.
 		a.emitted[idx] = true
@@ -1385,6 +1412,10 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 	}
 	if force {
 		if fn := normalizeOutboundFunctionCall(a.functionCall, a.shellArgKeys, a.allowedTools); fn != nil && !(a.emitted[-1] && a.clientAcked[-1]) {
+			name := strings.TrimSpace(stringValueAny(fn["name"]))
+			if preferred := preferredClientArgKey(name, a.pathArgKeys); preferred != "" {
+				fn["arguments"] = toolcall.ProjectPathArgsForClient(stringValueAny(fn["arguments"]), preferred)
+			}
 			a.emitted[-1] = true
 			a.clientAcked[-1] = false
 			a.pendingAcks = append(a.pendingAcks, -1)

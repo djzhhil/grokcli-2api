@@ -2809,6 +2809,104 @@ func ShellArgKeyMap(tools any) map[string]string {
 	return out
 }
 
+// PreferredPathArgKey inspects a tool parameters schema and returns the
+// client-facing file path key when it explicitly declares path or file_path.
+func PreferredPathArgKey(parameters any) string {
+	params, _ := parameters.(map[string]any)
+	if params == nil {
+		return ""
+	}
+	props, _ := params["properties"].(map[string]any)
+	req, _ := params["required"].([]any)
+	has := func(name string) bool {
+		if props != nil {
+			if _, ok := props[name]; ok {
+				return true
+			}
+		}
+		for _, item := range req {
+			if strings.EqualFold(strings.TrimSpace(fmt.Sprint(item)), name) {
+				return true
+			}
+		}
+		return false
+	}
+	hasPath, hasFilePath := has("path"), has("file_path")
+	if hasPath && !hasFilePath {
+		return "path"
+	}
+	if hasFilePath && !hasPath {
+		return "file_path"
+	}
+	for _, item := range req {
+		key := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
+		if key == "path" || key == "file_path" {
+			return key
+		}
+	}
+	return ""
+}
+
+// PathArgKeyMap builds tool-name → preferred file path key from a tools array.
+func PathArgKeyMap(tools any) map[string]string {
+	out := map[string]string{}
+	items, ok := tools.([]any)
+	if !ok {
+		return out
+	}
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		parameters := firstNonNil(tool["parameters"], tool["input_schema"])
+		if fn, ok := tool["function"].(map[string]any); ok {
+			name = strings.TrimSpace(fmt.Sprint(fn["name"]))
+			parameters = firstNonNil(fn["parameters"], fn["input_schema"], parameters)
+		}
+		if name == "" {
+			name = strings.TrimSpace(fmt.Sprint(tool["name"]))
+		}
+		preferred := PreferredPathArgKey(parameters)
+		if name == "" || preferred == "" {
+			continue
+		}
+		out[name] = preferred
+		out[strings.ToLower(name)] = preferred
+		if nk := nameKey(name); nk != "" {
+			out[nk] = preferred
+		}
+	}
+	return out
+}
+
+// ProjectPathArgsForClient rewrites path/file_path to the key advertised by
+// the client tool schema while preserving every other argument.
+func ProjectPathArgsForClient(argsJSON, preferredKey string) string {
+	preferredKey = strings.ToLower(strings.TrimSpace(preferredKey))
+	if preferredKey != "path" && preferredKey != "file_path" {
+		return argsJSON
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(strings.TrimSpace(argsJSON)), &obj) != nil || obj == nil {
+		return argsJSON
+	}
+	other := "file_path"
+	if preferredKey == "file_path" {
+		other = "path"
+	}
+	if empty(obj[preferredKey]) && !empty(obj[other]) {
+		obj[preferredKey] = obj[other]
+	}
+	delete(obj, other)
+	encoded, err := compactJSON(obj)
+	if err != nil {
+		return argsJSON
+	}
+	return encoded
+}
+
 // ProjectShellArgsForClient rewrites internal {"command":...} args into the
 // parameter name expected by the client schema (often Codex "cmd").
 // Non-shell tools / non-objects are returned unchanged.
@@ -3290,4 +3388,3 @@ func truncateForLog(s string, n int) string {
 // - Do NOT inject PowerShell instructions into the prompt (would bust cache).
 // - Do NOT rewrite command text (bash↔PS heuristics removed).
 // - Upstream shell schema is string-only; residual arrays are flattened without bash-style single quotes.
-

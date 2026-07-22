@@ -651,6 +651,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	// so outbound tool_calls project command→cmd (or honor pure command-only schemas).
 	keys := toolcall.ShellArgKeyMap(chatReq.Raw["tools"])
 	keys = ensureCodexShellCmdKeys(chatReq.Raw["tools"], keys)
+	pathKeys := toolcall.PathArgKeyMap(chatReq.Raw["tools"])
 	if keys == nil {
 		keys = map[string]string{}
 	}
@@ -666,6 +667,9 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	}
 	if len(keys) > 0 {
 		r = r.WithContext(withShellArgKeys(r.Context(), keys))
+	}
+	if len(pathKeys) > 0 {
+		r = r.WithContext(withPathArgKeys(r.Context(), pathKeys))
 	}
 	// Client-registered tools for Update/StrReplace → Edit remap on chat path.
 	if allowed := allowedAnthropicToolNames(chatReq.Raw); len(allowed) > 0 {
@@ -790,12 +794,9 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		writeProxyError(w, err)
 		return
 	}
-	// Project shell args for non-stream chat completions (Codex cmd / OpenAI command).
-	if result.Payload != nil && len(keys) > 0 {
-		projectChatPayloadShellArgs(result.Payload, keys)
-	} else if result.Payload != nil {
-		// Default shell-family tools to cmd even without an explicit map.
-		projectChatPayloadShellArgs(result.Payload, nil)
+	// Project normalized args back to the client-advertised tool schema.
+	if result.Payload != nil {
+		projectChatPayloadArgs(result.Payload, keys, pathKeys)
 	}
 	recordChatUsage(r, options, apiKey, result.AccountID, result.Model, chatReq.Stream, true, http.StatusOK, started, result.Usage, nil, 0, chatReq.Raw)
 	reportChatPool(r, options, result.AccountID, true, nil, http.StatusOK, result.Model)
@@ -814,9 +815,9 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	writeJSON(w, http.StatusOK, result.Payload)
 }
 
-// projectChatPayloadShellArgs rewrites shell tool_calls / function_call arguments
-// in a non-stream chat.completion payload to the client preferred key (cmd/command).
-func projectChatPayloadShellArgs(payload map[string]any, keys map[string]string) {
+// projectChatPayloadArgs rewrites tool_calls / function_call arguments in a
+// non-stream chat.completion payload to client-advertised parameter names.
+func projectChatPayloadArgs(payload map[string]any, shellKeys, pathKeys map[string]string) {
 	if payload == nil {
 		return
 	}
@@ -825,18 +826,18 @@ func projectChatPayloadShellArgs(payload map[string]any, keys map[string]string)
 		// collector uses []map[string]any
 		if typed, ok := payload["choices"].([]map[string]any); ok {
 			for _, ch := range typed {
-				projectChatChoiceShellArgs(ch, keys)
+				projectChatChoiceArgs(ch, shellKeys, pathKeys)
 			}
 		}
 		return
 	}
 	for _, item := range choices {
 		ch, _ := item.(map[string]any)
-		projectChatChoiceShellArgs(ch, keys)
+		projectChatChoiceArgs(ch, shellKeys, pathKeys)
 	}
 }
 
-func projectChatChoiceShellArgs(choice map[string]any, keys map[string]string) {
+func projectChatChoiceArgs(choice map[string]any, shellKeys, pathKeys map[string]string) {
 	if choice == nil {
 		return
 	}
@@ -847,11 +848,11 @@ func projectChatChoiceShellArgs(choice map[string]any, keys map[string]string) {
 	if calls, ok := msg["tool_calls"].([]any); ok {
 		for _, raw := range calls {
 			call, _ := raw.(map[string]any)
-			projectOneChatToolCall(call, keys)
+			projectOneChatToolCall(call, shellKeys, pathKeys)
 		}
 	} else if typed, ok := msg["tool_calls"].([]map[string]any); ok {
 		for _, call := range typed {
-			projectOneChatToolCall(call, keys)
+			projectOneChatToolCall(call, shellKeys, pathKeys)
 		}
 	}
 	if fn, ok := msg["function_call"].(map[string]any); ok && fn != nil {
@@ -859,23 +860,40 @@ func projectChatChoiceShellArgs(choice map[string]any, keys map[string]string) {
 		args := strings.TrimSpace(fmt.Sprint(fn["arguments"]))
 		if name != "" && args != "" && toolcall.IsShellTool(name) {
 			pref := toolcall.DefaultShellArgKey(name)
-			if keys != nil {
-				if v := strings.TrimSpace(keys[name]); v != "" {
+			if shellKeys != nil {
+				if v := strings.TrimSpace(shellKeys[name]); v != "" {
 					pref = v
-				} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+				} else if v := strings.TrimSpace(shellKeys[strings.ToLower(name)]); v != "" {
 					pref = v
 				} else if nk := toolcall.NameKey(name); nk != "" {
-					if v := strings.TrimSpace(keys[nk]); v != "" {
+					if v := strings.TrimSpace(shellKeys[nk]); v != "" {
 						pref = v
 					}
 				}
 			}
 			fn["arguments"] = toolcall.ProjectShellArgsForClient(args, name, pref)
+			args = strings.TrimSpace(fmt.Sprint(fn["arguments"]))
+		}
+		if pref := preferredSchemaArgKey(name, pathKeys); pref != "" {
+			fn["arguments"] = toolcall.ProjectPathArgsForClient(args, pref)
 		}
 	}
 }
 
-func projectOneChatToolCall(call map[string]any, keys map[string]string) {
+func preferredSchemaArgKey(name string, keys map[string]string) string {
+	if v := strings.TrimSpace(keys[name]); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+		return v
+	}
+	if nk := toolcall.NameKey(name); nk != "" {
+		return strings.TrimSpace(keys[nk])
+	}
+	return ""
+}
+
+func projectOneChatToolCall(call map[string]any, shellKeys, pathKeys map[string]string) {
 	if call == nil {
 		return
 	}
@@ -885,22 +903,20 @@ func projectOneChatToolCall(call map[string]any, keys map[string]string) {
 	}
 	name := strings.TrimSpace(fmt.Sprint(fn["name"]))
 	args := strings.TrimSpace(fmt.Sprint(fn["arguments"]))
-	if name == "" || args == "" || !toolcall.IsShellTool(name) {
+	if name == "" || args == "" {
 		return
 	}
-	pref := toolcall.DefaultShellArgKey(name)
-	if keys != nil {
-		if v := strings.TrimSpace(keys[name]); v != "" {
-			pref = v
-		} else if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
-			pref = v
-		} else if nk := toolcall.NameKey(name); nk != "" {
-			if v := strings.TrimSpace(keys[nk]); v != "" {
-				pref = v
-			}
+	if toolcall.IsShellTool(name) {
+		pref := preferredSchemaArgKey(name, shellKeys)
+		if pref == "" {
+			pref = toolcall.DefaultShellArgKey(name)
 		}
+		args = toolcall.ProjectShellArgsForClient(args, name, pref)
 	}
-	fn["arguments"] = toolcall.ProjectShellArgsForClient(args, name, pref)
+	if pref := preferredSchemaArgKey(name, pathKeys); pref != "" {
+		args = toolcall.ProjectPathArgsForClient(args, pref)
+	}
+	fn["arguments"] = args
 }
 
 func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reader, keepalive time.Duration) (proxy.StreamStats, error) {
@@ -930,6 +946,7 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	assembler := proxy.NewChatToolStreamAssembler()
 	// Project shell args to client schema (Codex: cmd) using keys from serveChatCompletions.
 	assembler.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+	assembler.SetPathArgKeys(pathArgKeysFrom(r.Context()))
 	// Remap Grok Update/StrReplace → client Edit when tools are known.
 	assembler.SetAllowedTools(allowedToolNamesFrom(r.Context()))
 	// Soft client write/ctx blips must NOT abort ReadSSE: aborting drains the
@@ -2026,6 +2043,23 @@ func shellArgKeysFrom(ctx context.Context) map[string]string {
 		return nil
 	}
 	v, _ := ctx.Value(shellArgKeysContextKey{}).(map[string]string)
+	return v
+}
+
+type pathArgKeysContextKey struct{}
+
+func withPathArgKeys(ctx context.Context, keys map[string]string) context.Context {
+	if len(keys) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, pathArgKeysContextKey{}, keys)
+}
+
+func pathArgKeysFrom(ctx context.Context) map[string]string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(pathArgKeysContextKey{}).(map[string]string)
 	return v
 }
 
