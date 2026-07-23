@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # grokcli-2api — single container with optional inline Turnstile Solver
 FROM golang:1.24-bookworm AS go-builder
 
