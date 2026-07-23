@@ -122,7 +122,9 @@ RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG ALL_PROXY
-RUN HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" ALL_PROXY="${ALL_PROXY:-}" \
+RUN --mount=type=secret,id=github_token,required=true \
+    set -a && . /run/secrets/github_token && set +a && \
+    HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" ALL_PROXY="${ALL_PROXY:-}" \
     python -m camoufox fetch \
     && test -n "$(find /root/.cache/camoufox -type f -size +100k -print -quit 2>/dev/null)" \
     && HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" ALL_PROXY="${ALL_PROXY:-}" \
