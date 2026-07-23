@@ -44,6 +44,7 @@ docker build \
   --add-host=host.docker.internal:host-gateway \
   --pull=false \
   --cache-from "$OLD_IMAGE" \
+  --secret id=github_token,src=/etc/daye/grokcli-github.env \
   --build-arg HTTP_PROXY="${BUILD_PROXY_URL}" \
   --build-arg HTTPS_PROXY="${BUILD_PROXY_URL}" \
   --build-arg ALL_PROXY="${BUILD_PROXY_URL}" \
