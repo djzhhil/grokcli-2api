@@ -73,7 +73,7 @@ class TurnstileAPIServer:
             hard_cap = 3
         hard_cap = max(1, min(8, hard_cap))
         self.thread_count = max(1, min(hard_cap, int(thread or 1)))
-        self.proxy_support = proxy_support
+        self.proxy_support = proxy_support or bool(os.getenv("TURNSTILE_PROXY_URL", "").strip())
         self.browser_pool = asyncio.Queue()
         self.use_random_config = use_random_config
         self.browser_name = browser_name
@@ -1039,11 +1039,15 @@ class TurnstileAPIServer:
 
             proxy = None
             if self.proxy_support:
+                proxy = os.getenv("TURNSTILE_PROXY_URL", "").strip() or None
                 proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
                 try:
-                    with open(proxy_file_path) as proxy_file:
-                        proxies = [line.strip() for line in proxy_file if line.strip()]
-                    proxy = random.choice(proxies) if proxies else None
+                    if not proxy:
+                        with open(proxy_file_path) as proxy_file:
+                            proxies = [line.strip() for line in proxy_file if line.strip()]
+
+                        proxy = random.choice(proxies) if proxies else None
+
                     if self.debug and proxy:
                         logger.debug(f"Browser {index}: Selected proxy: {proxy}")
                     elif self.debug and not proxy:
@@ -1421,10 +1425,11 @@ class TurnstileAPIServer:
             }
 
         if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
+            reason = str(result.get("error") or "Workers could not solve the Captcha")
             return {
                 "errorId": 1,
                 "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
-                "errorDescription": "Workers could not solve the Captcha"
+                "errorDescription": f"Local solver failed: {reason}"
             }
 
         if isinstance(result, dict) and result.get("value") and result.get("value") != "CAPTCHA_FAIL":
