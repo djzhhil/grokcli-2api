@@ -1,12 +1,17 @@
+# syntax=docker/dockerfile:1.7
 # grokcli-2api — single container with optional inline Turnstile Solver
 FROM golang:1.24-bookworm AS go-builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN go build -o /out/grok2api ./cmd/grok2api \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/grok2api ./cmd/grok2api \
     && go build -o /out/grok2api-migrate ./cmd/grok2api-migrate
 
 FROM python:3.12-slim-bookworm
@@ -108,7 +113,8 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 COPY requirements-store.txt /app/requirements-store.txt
 COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
-RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install -U pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /app/requirements.txt \
     && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
     && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
