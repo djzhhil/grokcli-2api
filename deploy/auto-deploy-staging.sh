@@ -13,12 +13,14 @@ flock -n 9 || exit 0
 
 cd "$SOURCE_DIR"
 
+GIT_PROXY_URL="${GROKCLI_GIT_PROXY_URL:-http://127.0.0.1:7890}"
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "ERROR: source worktree is not clean" >&2
   exit 1
 fi
 
-git fetch --prune origin main
+git -c http.proxy="$GIT_PROXY_URL" -c https.proxy="$GIT_PROXY_URL" fetch --prune origin main
 LOCAL_REV="$(git rev-parse main)"
 REMOTE_REV="$(git rev-parse origin/main)"
 
