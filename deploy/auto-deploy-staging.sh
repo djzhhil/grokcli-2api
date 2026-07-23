@@ -22,15 +22,19 @@ git fetch --prune origin main
 LOCAL_REV="$(git rev-parse main)"
 REMOTE_REV="$(git rev-parse origin/main)"
 
-if [[ "$LOCAL_REV" == "$REMOTE_REV" ]]; then
-  echo "Already deployed source: ${LOCAL_REV:0:7}"
-  exit 0
+if [[ "$LOCAL_REV" != "$REMOTE_REV" ]]; then
+  git merge --ff-only origin/main
 fi
 
-git merge --ff-only origin/main
 NEW_REV="$(git rev-parse --short HEAD)"
 OLD_IMAGE="$(docker inspect "$CONTAINER" --format '{{.Config.Image}}')"
 NEW_IMAGE="${IMAGE_REPO}:${NEW_REV}"
+
+if [[ "$OLD_IMAGE" == "$NEW_IMAGE" ]]; then
+  echo "Already deployed image: $NEW_IMAGE"
+  exit 0
+fi
+
 PROXY_URL="$(sed -n 's/^GROK_PROXY_URL=//p' "$COMPOSE_DIR/.env" | head -1 | tr -d '\"\r')"
 
 echo "Building $NEW_IMAGE using cache from $OLD_IMAGE"
