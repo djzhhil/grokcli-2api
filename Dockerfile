@@ -117,9 +117,17 @@ RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
     && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
 
-# Prefetch browser binaries used by inline solver
-RUN python -m camoufox fetch \
-    && python -m patchright install chromium || true
+# Prefetch browser binaries used by inline solver. Both browsers are required;
+# a successful Python package install alone is not enough for registration.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG ALL_PROXY
+RUN HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" ALL_PROXY="${ALL_PROXY:-}" \
+    python -m camoufox fetch \
+    && test -n "$(find /root/.cache/camoufox -type f -size +100k -print -quit 2>/dev/null)" \
+    && HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" ALL_PROXY="${ALL_PROXY:-}" \
+       python -m patchright install chromium \
+    && test -n "$(find /root/.cache/ms-playwright -type f -size +100k -print -quit 2>/dev/null)"
 
 COPY . /app
 COPY --from=go-builder /out/grok2api /app/bin/grok2api
