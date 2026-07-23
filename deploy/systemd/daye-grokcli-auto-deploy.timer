@@ -1,0 +1,11 @@
+[Unit]
+Description=Check grokcli-2api Fork for updates every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=daye-grokcli-auto-deploy.service
+
+[Install]
+WantedBy=timers.target

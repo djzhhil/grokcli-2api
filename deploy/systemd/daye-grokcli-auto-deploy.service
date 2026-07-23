@@ -1,0 +1,9 @@
+[Unit]
+Description=Auto-deploy grokcli-2api from GitHub Fork
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/daye-staging/source/grokcli-2api
+ExecStart=/opt/daye-staging/source/grokcli-2api/deploy/auto-deploy-staging.sh
