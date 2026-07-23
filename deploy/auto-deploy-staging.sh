@@ -35,15 +35,16 @@ if [[ "$OLD_IMAGE" == "$NEW_IMAGE" ]]; then
   exit 0
 fi
 
-PROXY_URL="$(sed -n 's/^GROK_PROXY_URL=//p' "$COMPOSE_DIR/.env" | head -1 | tr -d '\"\r')"
+BUILD_PROXY_URL="${GROKCLI_BUILD_PROXY_URL:-http://127.0.0.1:7890}"
 
 echo "Building $NEW_IMAGE using cache from $OLD_IMAGE"
 docker build \
+  --network=host \
   --pull=false \
   --cache-from "$OLD_IMAGE" \
-  --build-arg HTTP_PROXY="${PROXY_URL}" \
-  --build-arg HTTPS_PROXY="${PROXY_URL}" \
-  --build-arg ALL_PROXY="${PROXY_URL}" \
+  --build-arg HTTP_PROXY="${BUILD_PROXY_URL}" \
+  --build-arg HTTPS_PROXY="${BUILD_PROXY_URL}" \
+  --build-arg ALL_PROXY="${BUILD_PROXY_URL}" \
   --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
   --label org.opencontainers.image.source="https://github.com/djzhhil/grokcli-2api" \
   -t "$NEW_IMAGE" .
