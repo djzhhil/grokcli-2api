@@ -113,8 +113,7 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 COPY requirements-store.txt /app/requirements-store.txt
 COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install -U pip setuptools wheel \
+RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /app/requirements.txt \
     && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
     && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
