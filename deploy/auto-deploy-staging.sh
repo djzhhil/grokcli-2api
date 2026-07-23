@@ -39,6 +39,7 @@ PROXY_URL="$(sed -n 's/^GROK_PROXY_URL=//p' "$COMPOSE_DIR/.env" | head -1 | tr -
 
 echo "Building $NEW_IMAGE using cache from $OLD_IMAGE"
 docker build \
+  --pull=false \
   --cache-from "$OLD_IMAGE" \
   --build-arg HTTP_PROXY="${PROXY_URL}" \
   --build-arg HTTPS_PROXY="${PROXY_URL}" \
