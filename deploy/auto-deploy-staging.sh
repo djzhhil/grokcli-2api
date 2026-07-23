@@ -35,11 +35,11 @@ if [[ "$OLD_IMAGE" == "$NEW_IMAGE" ]]; then
   exit 0
 fi
 
-BUILD_PROXY_URL="${GROKCLI_BUILD_PROXY_URL:-http://127.0.0.1:7890}"
+BUILD_PROXY_URL="${GROKCLI_BUILD_PROXY_URL:-http://host.docker.internal:7890}"
 
 echo "Building $NEW_IMAGE using cache from $OLD_IMAGE"
 docker build \
-  --network=host \
+  --add-host=host.docker.internal:host-gateway \
   --pull=false \
   --cache-from "$OLD_IMAGE" \
   --build-arg HTTP_PROXY="${BUILD_PROXY_URL}" \
